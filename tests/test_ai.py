@@ -8,7 +8,14 @@ import pytest
 from pydantic import ValidationError
 
 from app import ai_service, judge
-from app.schemas import AIModelConfigPayload, AIProblemTaskPayload, GeneratedProblem
+from app.schemas import (
+    AIModelConfigPayload,
+    AIProblemTaskPayload,
+    GeneratedProblem,
+)
+from app.schemas import (
+    TestCase as GeneratedTestCase,
+)
 from tests.conftest import login
 
 
@@ -148,6 +155,73 @@ def fibonacci_payload() -> dict:
             "cout<<a;}\n"
         ),
         "solution_explanation": "从 F(0) 开始递推并在每一步取模。",
+    }
+
+
+def complexity_payload(*, stress_size: int = 12_000) -> dict:
+    generator = (
+        "import json\n"
+        f"n={stress_size}\n"
+        "data=f'{n}\\n'+' '.join(map(str,range(n,0,-1)))+'\\n'\n"
+        "print(json.dumps([{'label':'最大规模逆序数组','scale':n,'input':data}]))\n"
+    )
+    return {
+        "problem": {
+            "id": "AUTO",
+            "title": "逆序对计数",
+            "description": "给定一个整数数组，计算满足 i<j 且 a[i]>a[j] 的下标对数量。",
+            "input_description": "第一行 n，第二行 n 个整数。",
+            "output_description": "输出逆序对数量。",
+            "samples": [{"input": "5\n2 3 1 5 4\n", "output": "3\n"}],
+            "constraints": "1 <= n <= 12000，数组元素绝对值不超过 10^9。",
+            "testcases": [
+                {"input": "1\n7\n", "output": "0\n"},
+                {"input": "5\n1 2 3 4 5\n", "output": "0\n"},
+                {"input": "5\n5 4 3 2 1\n", "output": "10\n"},
+            ],
+            "tags": ["归并排序", "复杂度"],
+            "time_limit": 2.0,
+            "memory_limit": 128,
+            "difficulty": "中等",
+        },
+        "reference_solution": (
+            "import sys\n"
+            "it=iter(map(int,sys.stdin.buffer.read().split()))\n"
+            "n=next(it); a=[next(it) for _ in range(n)]\n"
+            "vals={v:i+1 for i,v in enumerate(sorted(set(a)))}\n"
+            "bit=[0]*(len(vals)+1); ans=0\n"
+            "for value in reversed(a):\n"
+            "    x=vals[value]; i=x-1\n"
+            "    while i: ans+=bit[i]; i-=i&-i\n"
+            "    i=x\n"
+            "    while i<len(bit): bit[i]+=1; i+=i&-i\n"
+            "print(ans)\n"
+        ),
+        "reference_solution_cpp": (
+            "#include <bits/stdc++.h>\nusing namespace std;\n"
+            "long long solve(vector<long long>&a,vector<long long>&t,int l,int r){"
+            "if(r-l<2)return 0;int m=(l+r)/2;long long z=solve(a,t,l,m)+solve(a,t,m,r);"
+            "int i=l,j=m,k=l;while(i<m||j<r){if(j==r||(i<m&&a[i]<=a[j]))t[k++]=a[i++];"
+            "else{t[k++]=a[j++];z+=m-i;}}for(i=l;i<r;i++)a[i]=t[i];return z;}\n"
+            "int main(){ios::sync_with_stdio(false);cin.tie(nullptr);int n;if(!(cin>>n))return 0;"
+            "vector<long long>a(n),t(n);for(auto&x:a)cin>>x;cout<<solve(a,t,0,n);}\n"
+        ),
+        "solution_explanation": "使用树状数组统计，时间复杂度 O(n log n)，空间复杂度 O(n)。",
+        "stress_test_generator": generator,
+        "complexity_probe_solution": (
+            "import sys\n"
+            "data=list(map(int,sys.stdin.buffer.read().split())); n=data[0]; a=data[1:]\n"
+            "ans=0\n"
+            "for i in range(n):\n"
+            "    for j in range(i+1,n): ans += a[i] > a[j]\n"
+            "print(ans)\n"
+        ),
+        "complexity_contract": {
+            "expected_time_complexity": "O(n log n)",
+            "expected_space_complexity": "O(n)",
+            "forbidden_time_complexities": ["O(n^2)"],
+            "stress_rationale": "n=12000 的逆序数组会让二重循环执行约七千万次。",
+        },
     }
 
 
@@ -354,6 +428,254 @@ def test_ai_resource_limits_follow_explicit_request_and_complexity() -> None:
     assert automatic["final"] == {"time_limit": 3.0, "memory_limit": 256}
     assert automatic_generated.problem.time_limit == 3.0
     assert automatic_generated.problem.memory_limit == 256
+
+
+def test_complexity_testcase_count_includes_materialized_stress_cases() -> None:
+    request = AIProblemTaskPayload(
+        requirement="设计一道需要大数据淘汰暴力算法的逆序对题",
+        difficulty="中等",
+        testcase_count=10,
+    )
+    generated = GeneratedProblem.model_validate(complexity_payload())
+    generated.problem.testcases = [
+        GeneratedTestCase(input=f"1\n{value}\n", output="0\n") for value in range(8)
+    ]
+
+    before_errors = ai_service._static_validation_errors(generated, request, None)
+    assert not any("少于要求" in error for error in before_errors)
+
+    generated.problem.testcases.extend(
+        [
+            GeneratedTestCase(input="2\n2 1\n", output="1\n"),
+            GeneratedTestCase(input="3\n3 2 1\n", output="3\n"),
+        ]
+    )
+    final_errors = ai_service._static_validation_errors(
+        generated,
+        request,
+        None,
+        stress_testcase_indexes={8, 9},
+    )
+    assert final_errors == []
+
+
+async def test_ai_materializes_stress_data_rejects_bruteforce_and_assigns_id(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await login(client)
+    await client.put(
+        "/api/ai/model-config",
+        json={
+            "provider_url": "https://example-model-provider.test/v1",
+            "model": "complexity-model",
+            "api_key": "secret",
+        },
+    )
+    payload = complexity_payload()
+    calls = 0
+
+    async def fake_provider(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        content = "逆序对复杂度与最大规模分析" if calls == 1 else json.dumps(payload)
+        return content, {"input_tokens": 10, "output_tokens": 20}
+
+    monkeypatch.setattr(ai_service, "_provider_request", fake_provider)
+    response = await client.post(
+        "/api/ai/problem-tasks/",
+        json={
+            "requirement": "生成逆序对计数题，必须用大数据验证复杂度并淘汰 O(n^2) 暴力解",
+            "knowledge_points": ["归并排序", "复杂度"],
+            "difficulty": "中等",
+            "testcase_count": 3,
+        },
+    )
+    task = await _wait_task(client, response.json()["data"]["task_id"])
+
+    assert task["status"] == "completed", task
+    assert calls == 2
+    assert task["result"]["problem"]["id"] == "AI0001"
+    assert task["result"]["validation"]["id_assignment"] == {
+        "source": "automatic",
+        "model_id": "AUTO",
+        "final_id": "AI0001",
+    }
+    testcases = task["result"]["problem"]["testcases"]
+    assert len(testcases) == 4
+    assert len(testcases[-1]["input"]) > 20_000
+    assert testcases[-1]["output"] == str(12_000 * 11_999 // 2)
+    complexity = task["result"]["validation"]["complexity_validation"]
+    assert complexity["passed"] is True
+    assert complexity["rejected_stress_cases"] == 1
+    assert complexity["probe_results"][-1]["status"] == "TLE"
+    assert task["result"]["validation"]["resource_tuning"]["applied"] is True
+    assert task["result"]["problem"]["time_limit"] <= 2.0
+
+    created = await client.post("/api/problems/", json=task["result"]["problem"])
+    assert created.status_code == 200
+    submitted = await client.post(
+        "/api/submissions/",
+        json={
+            "problem_id": "AI0001",
+            "language": "python",
+            "code": payload["complexity_probe_solution"],
+        },
+    )
+    submission_id = int(submitted.json()["data"]["submission_id"])
+    await judge.wait_for_submission(submission_id, timeout=10)
+    detail = (await client.get(f"/api/submissions/{submission_id}")).json()["data"]
+    assert detail["result"] == "TLE"
+
+
+async def test_ai_repairs_stress_data_when_bruteforce_still_passes(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await login(client)
+    await client.put(
+        "/api/ai/model-config",
+        json={
+            "provider_url": "https://example-model-provider.test/v1",
+            "model": "stress-repair-model",
+            "api_key": "secret",
+        },
+    )
+    weak = complexity_payload(stress_size=50)
+    strong = complexity_payload(stress_size=12_000)
+    calls = 0
+
+    async def fake_provider(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            content = "先验证低效算法是否会在最大规模超时"
+        elif calls == 2:
+            content = json.dumps(weak)
+        else:
+            content = json.dumps(
+                {
+                    "stress_test_generator": strong["stress_test_generator"],
+                    "complexity_probe_solution": strong["complexity_probe_solution"],
+                    "complexity_contract": strong["complexity_contract"],
+                }
+            )
+        return content, {"input_tokens": 10, "output_tokens": 20}
+
+    monkeypatch.setattr(ai_service, "_provider_request", fake_provider)
+    response = await client.post(
+        "/api/ai/problem-tasks/",
+        json={
+            "requirement": "生成逆序对题并严格考验复杂度，确保 O(n^2) 暴力算法超时",
+            "knowledge_points": ["归并排序", "复杂度"],
+            "difficulty": "中等",
+        },
+    )
+    task = await _wait_task(client, response.json()["data"]["task_id"])
+
+    assert task["status"] == "completed", task
+    assert calls == 3
+    assert task["usage"]["calls"][-1]["stage"] == "强化复杂度压力 1/2"
+    assert task["result"]["validation"]["automatic_repair_count"] == 1
+    complexity = task["result"]["validation"]["complexity_validation"]
+    assert complexity["passed"] is True
+    assert complexity["items"][0]["scale"] == 12_000
+    assert complexity["probe_results"][-1]["status"] == "TLE"
+
+
+async def test_complexity_validation_rejects_fake_delays_and_accepts_real_mle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = AIProblemTaskPayload(
+        requirement="设计一道严格验证时空复杂度并淘汰暴力解的题目",
+        difficulty="中等",
+    )
+    unsafe_payload = complexity_payload()
+    unsafe_payload["stress_test_generator"] = "import os\nprint('[]')\n"
+    unsafe = GeneratedProblem.model_validate(unsafe_payload)
+    _, errors, _ = await ai_service._materialize_stress_cases(unsafe, request)
+    assert any("禁用操作" in error for error in errors)
+
+    optional_request = AIProblemTaskPayload(
+        requirement="设计一道基础数组求和题，帮助初学者练习循环",
+        difficulty="简单",
+    )
+    unchanged, errors, metadata = await ai_service._materialize_stress_cases(
+        unsafe, optional_request
+    )
+    assert unchanged is unsafe
+    assert errors == []
+    assert metadata["required"] is False
+
+    delayed = GeneratedProblem.model_validate(complexity_payload())
+    delayed.complexity_probe_solution = "while True:\n    pass\n"
+    delayed.problem.testcases.append(GeneratedTestCase(input="12000\n", output="71994000\n"))
+    errors, _ = await ai_service._validate_complexity_probe(
+        delayed,
+        request,
+        {3},
+        {"stress_testcase_indexes": [3]},
+    )
+    assert any("人为延迟" in error for error in errors)
+
+    memory_probe = GeneratedProblem.model_validate(complexity_payload())
+    memory_probe.problem.testcases.append(GeneratedTestCase(input="12000\n", output="71994000\n"))
+
+    async def fake_probe_execution(
+        _problem, _solution, language="python", *, inputs=None
+    ) -> judge.ReferenceExecution:
+        assert language == "python"
+        assert inputs is not None
+        expected = [
+            case.output
+            for case in [
+                *memory_probe.problem.samples,
+                *memory_probe.problem.testcases[:3],
+            ]
+        ]
+        results = [judge.ProcessResult("OK", 0, output, "", 0.01, 8.0) for output in expected]
+        results.append(judge.ProcessResult("MLE", -9, "", "MLE", 0.2, 65.0))
+        return judge.ReferenceExecution(language, None, results)
+
+    monkeypatch.setattr(ai_service, "execute_reference_solution", fake_probe_execution)
+    errors, metadata = await ai_service._validate_complexity_probe(
+        memory_probe,
+        request,
+        {3},
+        {"stress_testcase_indexes": [3]},
+    )
+    assert errors == []
+    assert metadata["passed"] is True
+    assert metadata["probe_results"][-1]["status"] == "MLE"
+
+
+async def test_ai_assigns_sequential_ids(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await login(client)
+    await client.put(
+        "/api/ai/model-config",
+        json={
+            "provider_url": "https://example-model-provider.test/v1",
+            "model": "id-model",
+            "api_key": "secret",
+        },
+    )
+
+    async def fake_provider(*_args, **kwargs):
+        if not kwargs.get("json_mode"):
+            return "基础题分析", {"input_tokens": 1, "output_tokens": 1}
+        return json.dumps(generated_payload()), {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ai_service, "_provider_request", fake_provider)
+    ids = []
+    for suffix in ("第一题", "第二题"):
+        response = await client.post(
+            "/api/ai/problem-tasks/",
+            json={"requirement": f"设计一道用于验证顺序编号的三数求和{suffix}"},
+        )
+        task = await _wait_task(client, response.json()["data"]["task_id"])
+        assert task["status"] == "completed", task
+        ids.append(task["result"]["problem"]["id"])
+    assert ids == ["AI0001", "AI0002"]
 
 
 async def test_ai_repairs_placeholder_test_data_instead_of_reference_solution(
