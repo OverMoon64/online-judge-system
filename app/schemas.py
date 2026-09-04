@@ -122,10 +122,11 @@ class AIProblemTaskPayload(StrictModel):
     model_config_name: str | None = Field(default=None, min_length=1, max_length=60)
     knowledge_points: list[str] = Field(default_factory=list, max_length=20)
     difficulty: str = Field(default="中等", max_length=40)
-    testcase_count: int = Field(default=6, ge=2, le=10)
+    testcase_count: int | None = Field(default=None, ge=2, le=10)
 
 
 class GeneratedProblem(StrictModel):
     problem: ProblemPayload
     reference_solution: str = Field(min_length=1)
+    reference_solution_cpp: str = Field(min_length=1)
     solution_explanation: str = ""

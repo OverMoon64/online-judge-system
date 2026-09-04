@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from app import ai_service
-from app.schemas import AIModelConfigPayload
+from app.schemas import AIModelConfigPayload, AIProblemTaskPayload
 from tests.conftest import login
 
 
@@ -20,6 +20,11 @@ def test_model_config_name_rejects_path_separators():
             model="fake-model",
             api_key="secret",
         )
+
+
+def test_problem_task_uses_automatic_testcase_strategy_by_default():
+    payload = AIProblemTaskPayload(requirement="设计一道用于课程验收的算法题目")
+    assert payload.testcase_count is None
 
 
 async def test_provider_failure_retries_twice(monkeypatch):
@@ -50,6 +55,28 @@ async def test_provider_failure_retries_twice(monkeypatch):
     assert attempts == 3
 
 
+async def test_stream_preview_callback_updates_running_task(monkeypatch):
+    updates: list[dict] = []
+
+    async def capture_update(task_id, **kwargs):
+        updates.append({"task_id": task_id, **kwargs})
+
+    monkeypatch.setattr(ai_service, "_update_task", capture_update)
+    callback = ai_service._stream_preview_callback("task-stream", "题面")
+
+    await callback("正在流式生成题面")
+
+    assert updates == [
+        {
+            "task_id": "task-stream",
+            "result": {
+                "stream_stage": "题面",
+                "stream_preview": "正在流式生成题面",
+            },
+        }
+    ]
+
+
 def generated_payload() -> dict:
     return {
         "problem": {
@@ -71,6 +98,10 @@ def generated_payload() -> dict:
             "difficulty": "入门",
         },
         "reference_solution": "a,b,c=map(int,input().split())\nprint(a+b+c)\n",
+        "reference_solution_cpp": (
+            "#include <iostream>\nusing namespace std;\n"
+            "int main(){long long a,b,c;cin>>a>>b>>c;cout<<a+b+c;}\n"
+        ),
         "solution_explanation": "直接求和，时间复杂度 O(1)。",
     }
 
@@ -148,6 +179,7 @@ async def test_ai_config_generation_usage_and_secret_masking(
     task = await _wait_task(client, response.json()["data"]["task_id"])
     assert task["status"] == "completed", task
     assert task["result"]["validation"]["passed"] is True
+    assert task["result"]["validation"]["reference_languages"] == ["python", "cpp"]
     assert task["usage"]["input_tokens"] == 200
     assert task["usage"]["output_tokens"] == 100
     assert task["usage"]["cost"] == 0.0012

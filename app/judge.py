@@ -390,15 +390,36 @@ async def wait_for_submission(submission_id: int, timeout: float = 10.0) -> None
 
 
 async def validate_reference_solution(
-    problem: ProblemPayload, reference_solution: str
+    problem: ProblemPayload, reference_solution: str, language: str = "python"
 ) -> list[str]:
     errors: list[str] = []
     with tempfile.TemporaryDirectory(prefix="oj-ai-validation-") as temp_name:
-        source = Path(temp_name) / "solution.py"
+        if language not in {"python", "cpp"}:
+            raise ValueError("reference solution language must be python or cpp")
+        source = Path(temp_name) / ("solution.cpp" if language == "cpp" else "solution.py")
+        executable = Path(temp_name) / "solution"
         await asyncio.to_thread(source.write_text, reference_solution, encoding="utf-8")
+        if language == "cpp":
+            compile_result = await run_process(
+                ["g++", "-std=c++14", "-O2", "-pipe", str(source), "-o", str(executable)],
+                "",
+                get_settings().compile_timeout_seconds,
+                max(problem.memory_limit, 256),
+            )
+            if compile_result.status != "OK":
+                return [
+                    "compile: "
+                    + _sanitize_message(
+                        compile_result.stderr or compile_result.status,
+                        temp_name,
+                    )
+                ]
+            run_command = [str(executable)]
+        else:
+            run_command = ["python3", str(source)]
         for index, testcase in enumerate(problem.testcases, start=1):
             result = await run_process(
-                ["python3", str(source)],
+                run_command,
                 testcase.input,
                 problem.time_limit,
                 problem.memory_limit,

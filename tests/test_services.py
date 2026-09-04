@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from types import SimpleNamespace
 
@@ -89,6 +90,15 @@ async def test_process_runner_unknown_runtime_output_limit_and_reference_validat
     assert mismatch == ["testcase 1: reference solution output mismatch"]
     runtime = await judge.validate_reference_solution(problem, "raise RuntimeError('bad')")
     assert runtime == ["testcase 1: RE"]
+    cpp_solution = (
+        "#include <iostream>\nusing namespace std;\n"
+        "int main(){string value;getline(cin,value);cout<<value;}\n"
+    )
+    assert await judge.validate_reference_solution(problem, cpp_solution, language="cpp") == []
+    cpp_compile_error = await judge.validate_reference_solution(
+        problem, "int main( {", language="cpp"
+    )
+    assert cpp_compile_error[0].startswith("compile:")
     await judge.cancel_submission_task(99999)
     await judge.cancel_all_submission_tasks()
 
@@ -109,9 +119,33 @@ class _FakeResponse:
             raise self.payload
         return self.payload
 
+    async def aiter_lines(self):
+        if isinstance(self.payload, Exception):
+            raise self.payload
+        if isinstance(self.payload, list):
+            for line in self.payload:
+                yield line
+            return
+        yield json.dumps(self.payload)
+
+
+class _FakeStreamContext:
+    def __init__(self, response) -> None:
+        self.response = response
+
+    async def __aenter__(self):
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+    async def __aexit__(self, *args) -> None:
+        del args
+
 
 class _FakeClient:
     response: _FakeResponse | Exception
+    fallback_response: _FakeResponse | Exception | None = None
+    last_json: dict | None = None
 
     def __init__(self, *args, **kwargs) -> None:
         del args, kwargs
@@ -124,9 +158,15 @@ class _FakeClient:
 
     async def post(self, *args, **kwargs):
         del args, kwargs
-        if isinstance(self.response, Exception):
-            raise self.response
-        return self.response
+        response = self.fallback_response or self.response
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def stream(self, *args, **kwargs):
+        del args
+        self.__class__.last_json = kwargs["json"]
+        return _FakeStreamContext(self.response)
 
 
 async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -140,6 +180,37 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     content, usage = await ai_service._provider_request(_config(), [])
     assert content == "answer"
     assert usage == {"input_tokens": 3, "output_tokens": 4}
+    assert _FakeClient.last_json["stream"] is True
+
+    _FakeClient.response = _FakeResponse(
+        [
+            'data: {"choices":[{"delta":{"content":"ans"}}]}',
+            'data: {"choices":[{"delta":{"content":"wer"}}]}',
+            ('data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":6}}'),
+            "data: [DONE]",
+        ]
+    )
+    deltas: list[str] = []
+
+    async def capture_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    content, usage = await ai_service._provider_request(_config(), [], on_delta=capture_delta)
+    assert content == "answer"
+    assert deltas == ["ans", "wer"]
+    assert usage == {"input_tokens": 5, "output_tokens": 6}
+
+    _FakeClient.response = _FakeResponse({}, status_code=400)
+    _FakeClient.fallback_response = _FakeResponse(
+        {
+            "choices": [{"message": {"content": "fallback answer"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 8},
+        }
+    )
+    content, usage = await ai_service._provider_request(_config(), [])
+    assert content == "fallback answer"
+    assert usage == {"input_tokens": 7, "output_tokens": 8}
+    _FakeClient.fallback_response = None
 
     _FakeClient.response = _FakeResponse({}, status_code=401)
     with pytest.raises(RuntimeError, match="HTTP 401"):

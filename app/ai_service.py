@@ -7,6 +7,7 @@ import json
 import re
 import uuid
 from base64 import urlsafe_b64encode
+from collections.abc import Awaitable, Callable
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ _model_store_path_override: Path | None = None
 _model_store_loaded = False
 _model_store_lock: asyncio.Lock | None = None
 _running_tasks: dict[str, asyncio.Task[None]] = {}
+StreamCallback = Callable[[str], Awaitable[None]]
 
 
 def _public_config(
@@ -214,7 +216,10 @@ def _completion_endpoint(base_url: str) -> str:
 
 
 async def _provider_request(
-    config: AIModelConfigPayload, messages: list[dict[str, str]]
+    config: AIModelConfigPayload,
+    messages: list[dict[str, str]],
+    *,
+    on_delta: StreamCallback | None = None,
 ) -> tuple[str, dict[str, int]]:
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     payload = {
@@ -224,17 +229,30 @@ async def _provider_request(
     }
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
-            response = await client.post(
-                _completion_endpoint(config.provider_url), headers=headers, json=payload
-            )
-        response.raise_for_status()
-        body = response.json()
-        content = body["choices"][0]["message"]["content"]
-        usage = body.get("usage") or {}
-        return str(content), {
-            "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
-            "output_tokens": int(usage.get("completion_tokens", 0) or 0),
-        }
+            endpoint = _completion_endpoint(config.provider_url)
+            stream_payload = {
+                **payload,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            async with client.stream(
+                "POST",
+                endpoint,
+                headers=headers,
+                json=stream_payload,
+            ) as response:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code not in {400, 404, 422}:
+                        raise
+                    fallback = await client.post(endpoint, headers=headers, json=payload)
+                    fallback.raise_for_status()
+                    content, usage = _parse_non_stream_response(fallback.json())
+                    if on_delta:
+                        await on_delta(content)
+                    return content, usage
+                return await _consume_stream_response(response, on_delta)
     except httpx.TimeoutException as exc:
         raise RuntimeError("模型服务请求超时") from exc
     except httpx.HTTPStatusError as exc:
@@ -250,15 +268,81 @@ async def _provider_request_with_retry(
     messages: list[dict[str, str]],
     *,
     retry_count: int = 2,
+    on_delta: StreamCallback | None = None,
 ) -> tuple[str, dict[str, int]]:
     for attempt in range(retry_count + 1):
         try:
-            return await _provider_request(config, messages)
+            return await _provider_request(config, messages, on_delta=on_delta)
         except RuntimeError:
             if attempt >= retry_count:
                 raise
             await asyncio.sleep(0.5 * (2**attempt))
     raise RuntimeError("模型服务请求失败")
+
+
+def _token_usage(value: dict[str, Any] | None) -> dict[str, int]:
+    usage = value or {}
+    return {
+        "input_tokens": int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0),
+        "output_tokens": int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0),
+    }
+
+
+def _parse_non_stream_response(body: dict[str, Any]) -> tuple[str, dict[str, int]]:
+    content = body["choices"][0]["message"]["content"]
+    if not isinstance(content, str) or not content:
+        raise ValueError("model response content is empty")
+    return content, _token_usage(body.get("usage"))
+
+
+def _delta_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(
+            str(item.get("text", ""))
+            for item in value
+            if isinstance(item, dict) and item.get("type") in {"text", "output_text"}
+        )
+    return ""
+
+
+async def _consume_stream_response(
+    response: httpx.Response,
+    on_delta: StreamCallback | None,
+) -> tuple[str, dict[str, int]]:
+    content_parts: list[str] = []
+    raw_lines: list[str] = []
+    usage = {"input_tokens": 0, "output_tokens": 0}
+    received_event = False
+    async for line in response.aiter_lines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("data:"):
+            raw_lines.append(stripped)
+            continue
+        received_event = True
+        event_data = stripped.removeprefix("data:").strip()
+        if event_data == "[DONE]":
+            continue
+        event = json.loads(event_data)
+        if event.get("usage"):
+            usage = _token_usage(event["usage"])
+        choices = event.get("choices") or []
+        if not choices:
+            continue
+        delta = _delta_text((choices[0].get("delta") or {}).get("content"))
+        if delta:
+            content_parts.append(delta)
+            if on_delta:
+                await on_delta(delta)
+    if not received_event:
+        return _parse_non_stream_response(json.loads("\n".join(raw_lines)))
+    content = "".join(content_parts)
+    if not content:
+        raise ValueError("model stream content is empty")
+    return content, usage
 
 
 def _empty_usage(config: AIModelConfigPayload) -> dict[str, Any]:
@@ -330,6 +414,31 @@ async def _update_task(
         await session.commit()
 
 
+def _stream_preview_callback(task_id: str, stage: str) -> StreamCallback:
+    streamed_text = ""
+    pending_characters = 0
+    last_update = 0.0
+
+    async def update_preview(delta: str) -> None:
+        nonlocal streamed_text, pending_characters, last_update
+        streamed_text += delta
+        pending_characters += len(delta)
+        now = asyncio.get_running_loop().time()
+        if pending_characters < 160 and now - last_update < 0.5:
+            return
+        pending_characters = 0
+        last_update = now
+        await _update_task(
+            task_id,
+            result={
+                "stream_stage": stage,
+                "stream_preview": streamed_text[-4000:],
+            },
+        )
+
+    return update_preview
+
+
 def _extract_json(content: str) -> dict[str, Any]:
     cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", content.strip())
     start, end = cleaned.find("{"), cleaned.rfind("}")
@@ -345,13 +454,18 @@ def _generation_prompt(
     request: AIProblemTaskPayload, blueprint: str, existing: dict[str, Any] | None
 ) -> str:
     existing_text = json.dumps(existing, ensure_ascii=False) if existing else "无"
+    testcase_requirement = (
+        f"生成至少 {request.testcase_count} 个互不重复的隐藏测试点"
+        if request.testcase_count
+        else "根据算法复杂度、边界规模和预计运行时长，生成 2 到 10 个互不重复的隐藏测试点"
+    )
     return f"""
 你是程序设计训练课程的严谨命题专家。请根据命题需求和分析草案生成一道可直接导入 OJ 的题目。
 
 命题需求：{request.requirement}
 知识点：{", ".join(request.knowledge_points) or "由需求推断"}
 难度：{request.difficulty}
-至少生成 {request.testcase_count} 个互不重复的测试点，必须包含最小值、最大值、特殊结构和能区分低效算法的数据。
+{testcase_requirement}，必须包含最小值、最大值、特殊结构和能区分低效算法的数据。
 参考已有题目：{existing_text}
 分析草案：{blueprint}
 
@@ -367,9 +481,10 @@ def _generation_prompt(
     "difficulty": "{request.difficulty}"
   }},
   "reference_solution": "完整 Python 3 程序",
+  "reference_solution_cpp": "完整 C++14 程序",
   "solution_explanation": "正确性和复杂度说明"
 }}
-所有 output 必须与 reference_solution 对应，且代码只能使用 Python 标准库。
+两个参考程序必须使用相同算法并对所有 output 给出一致结果；Python 只能使用标准库，C++ 使用 C++14。
 """.strip()
 
 
@@ -379,7 +494,9 @@ async def _validate_generated(
     existing: dict[str, Any] | None,
 ) -> list[str]:
     errors: list[str] = []
-    if len(generated.problem.testcases) < request.testcase_count:
+    if not 2 <= len(generated.problem.testcases) <= 10:
+        errors.append("隐藏测试点数量必须在 2 到 10 之间")
+    elif request.testcase_count and len(generated.problem.testcases) < request.testcase_count:
         errors.append(f"测试点少于要求的 {request.testcase_count} 个")
     inputs = [case.input for case in generated.problem.testcases]
     if len(set(inputs)) != len(inputs):
@@ -389,6 +506,12 @@ async def _validate_generated(
     errors.extend(
         await validate_reference_solution(generated.problem, generated.reference_solution)
     )
+    cpp_errors = await validate_reference_solution(
+        generated.problem,
+        generated.reference_solution_cpp,
+        language="cpp",
+    )
+    errors.extend(f"C++ {error}" for error in cpp_errors)
     return errors
 
 
@@ -415,12 +538,14 @@ async def _run_problem_task(
             progress="正在分析知识点、难度和边界条件",
             progress_percent=10,
             usage=usage,
+            result={"stream_stage": "需求分析", "stream_preview": ""},
         )
         analysis_prompt = (
             "请为下面的程序设计题命题需求制定简洁但严格的命题蓝图，重点分析知识点、"
             "预期算法、复杂度、边界条件和用于淘汰错误/低效算法的测试策略。\n"
             f"需求：{request.requirement}\n难度：{request.difficulty}\n"
-            f"知识点：{request.knowledge_points}\n测试点数量：{request.testcase_count}"
+            f"知识点：{request.knowledge_points}\n"
+            f"测试点策略：{request.testcase_count or '按复杂度和运行时长自动决定 2-10 个'}"
         )
         blueprint, current_usage = await _provider_request_with_retry(
             config,
@@ -428,6 +553,7 @@ async def _run_problem_task(
                 {"role": "system", "content": "你是严谨的算法课程命题专家。"},
                 {"role": "user", "content": analysis_prompt},
             ],
+            on_delta=_stream_preview_callback(task_id, "需求分析"),
         )
         _merge_usage(usage, current_usage, config)
         await _record_model_usage(user_id, config_name, current_usage, config)
@@ -437,6 +563,7 @@ async def _run_problem_task(
             progress="正在生成题面、参考解法和分层测试点",
             progress_percent=45,
             usage=usage,
+            result={"stream_stage": "题面、解法与测试点", "stream_preview": ""},
         )
         content, current_usage = await _provider_request_with_retry(
             config,
@@ -444,6 +571,7 @@ async def _run_problem_task(
                 {"role": "system", "content": "你必须只输出严格 JSON，所有测试答案必须正确。"},
                 {"role": "user", "content": _generation_prompt(request, blueprint, existing)},
             ],
+            on_delta=_stream_preview_callback(task_id, "题面、解法与测试点"),
         )
         _merge_usage(usage, current_usage, config)
         await _record_model_usage(user_id, config_name, current_usage, config)
@@ -469,6 +597,7 @@ async def _run_problem_task(
                 progress="初稿未通过校验，正在进行一次自动修正",
                 progress_percent=85,
                 usage=usage,
+                result={"stream_stage": "自动修正", "stream_preview": ""},
             )
             repair_prompt = (
                 "请修正下面的 OJ 题目 JSON。只返回完整、严格 JSON，不要解释。\n"
@@ -480,6 +609,7 @@ async def _run_problem_task(
                     {"role": "system", "content": "你是 OJ 题目质量审查员。"},
                     {"role": "user", "content": repair_prompt},
                 ],
+                on_delta=_stream_preview_callback(task_id, "自动修正"),
             )
             _merge_usage(usage, current_usage, config)
             await _record_model_usage(user_id, config_name, current_usage, config)
@@ -494,6 +624,7 @@ async def _run_problem_task(
             "passed": True,
             "testcase_count": len(generated.problem.testcases),
             "reference_solution_executed": True,
+            "reference_languages": ["python", "cpp"],
             "automatic_repair_used": bool(validation_message),
         }
         await _update_task(
