@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from frontend.app import status_badge, submission_verdict
+from frontend.app import output_calibration_rows, status_badge, submission_verdict
 
 
 @pytest.mark.parametrize(
@@ -34,6 +34,42 @@ def test_submission_badges_include_acronym_and_distinct_colors() -> None:
     assert (
         len({badge.split("background:", 1)[1].split(";", 1)[0] for badge in badges.values()}) == 6
     )
+
+
+def test_output_calibration_rows_are_readable() -> None:
+    rows = output_calibration_rows(
+        {
+            "output_calibration": {
+                "applied": True,
+                "count": 2,
+                "items": [
+                    {
+                        "kind": "sample",
+                        "index": 1,
+                        "input": "100\n",
+                        "original_output": "wrong",
+                        "calibrated_output": "687995182",
+                    },
+                    {
+                        "kind": "testcase",
+                        "index": 3,
+                        "input": "100000\n",
+                        "original_output": "",
+                        "calibrated_output": "911435502",
+                    },
+                ],
+            }
+        }
+    )
+    assert rows[0] == {
+        "类型": "样例",
+        "序号": 1,
+        "输入": "100\n",
+        "模型原答案": "wrong",
+        "校准答案": "687995182",
+    }
+    assert rows[1]["类型"] == "隐藏测试点"
+    assert rows[1]["模型原答案"] == ""
 
 
 def test_frontend_initial_account_page_renders() -> None:
