@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from frontend.app import output_calibration_rows, status_badge, submission_verdict
+from frontend.app import (
+    output_calibration_rows,
+    resolve_problem_selection,
+    status_badge,
+    submission_verdict,
+)
 
 
 @pytest.mark.parametrize(
@@ -70,6 +75,14 @@ def test_output_calibration_rows_are_readable() -> None:
     }
     assert rows[1]["类型"] == "隐藏测试点"
     assert rows[1]["模型原答案"] == ""
+
+
+def test_problem_selection_survives_reruns_and_problem_list_changes() -> None:
+    problem_ids = ["first", "chosen", "last"]
+    assert resolve_problem_selection(problem_ids, None, "chosen") == "chosen"
+    assert resolve_problem_selection(problem_ids, "chosen") == "chosen"
+    assert resolve_problem_selection(problem_ids, "missing") == "first"
+    assert resolve_problem_selection([], "chosen") is None
 
 
 def test_frontend_initial_account_page_renders() -> None:

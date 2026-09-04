@@ -108,6 +108,7 @@ def clear_local_session(*, close_client: bool = False) -> None:
         "selected_submission_id",
         "problem_section",
         "next_problem_section",
+        "judge_problem_id",
         "main_navigation",
         "next_navigation",
     ):
@@ -187,6 +188,16 @@ def output_calibration_rows(validation: dict[str, Any]) -> list[dict[str, Any]]:
         }
         for item in calibration.get("items") or []
     ]
+
+
+def resolve_problem_selection(
+    problem_ids: list[str], current: str | None, requested: str | None = None
+) -> str | None:
+    if requested in problem_ids:
+        return requested
+    if current in problem_ids:
+        return current
+    return problem_ids[0] if problem_ids else None
 
 
 def api_call(method: str, path: str, *, quiet: bool = False, **kwargs: Any) -> dict[str, Any]:
@@ -565,7 +576,7 @@ def page_problems() -> None:
                     if action_col.button(
                         "进入题目", key=f"open_problem_{data['id']}", width="stretch"
                     ):
-                        st.session_state.submit_problem_id = data["id"]
+                        st.session_state.judge_problem_id = data["id"]
                         st.session_state.next_problem_section = "题目详情与提交"
                         st.rerun()
             if login["role"] == "admin":
@@ -762,14 +773,18 @@ def render_problem_workspace() -> None:
     elif not languages:
         st.warning("尚未配置可用语言，请联系管理员。")
     else:
-        problem_map = {f"{item['id']} · {item['title']}": item["id"] for item in problems}
-        labels = list(problem_map)
-        preferred = st.session_state.pop("submit_problem_id", None)
-        selected_index = next(
-            (index for index, label in enumerate(labels) if problem_map[label] == preferred), 0
+        titles = {item["id"]: item["title"] for item in problems}
+        problem_ids = list(titles)
+        st.session_state.judge_problem_id = resolve_problem_selection(
+            problem_ids,
+            st.session_state.get("judge_problem_id"),
         )
-        problem_label = st.selectbox("选择题目 *", labels, index=selected_index)
-        selected_problem_id = problem_map[problem_label]
+        selected_problem_id = st.selectbox(
+            "选择题目 *",
+            problem_ids,
+            key="judge_problem_id",
+            format_func=lambda problem_id: f"{problem_id} · {titles[problem_id]}",
+        )
         selected_detail = api_call("GET", f"/api/problems/{selected_problem_id}", quiet=True)
         if selected_detail.get("code") == 200:
             render_problem_statement(selected_detail["data"])
