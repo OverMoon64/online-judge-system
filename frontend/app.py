@@ -174,6 +174,21 @@ def submission_verdict(data: dict[str, Any]) -> str:
     return "UNK"
 
 
+def output_calibration_rows(validation: dict[str, Any]) -> list[dict[str, Any]]:
+    calibration = validation.get("output_calibration") or {}
+    labels = {"sample": "样例", "testcase": "隐藏测试点"}
+    return [
+        {
+            "类型": labels.get(str(item.get("kind")), str(item.get("kind") or "—")),
+            "序号": item.get("index", "—"),
+            "输入": item.get("input", ""),
+            "模型原答案": item.get("original_output", ""),
+            "校准答案": item.get("calibrated_output", ""),
+        }
+        for item in calibration.get("items") or []
+    ]
+
+
 def api_call(method: str, path: str, *, quiet: bool = False, **kwargs: Any) -> dict[str, Any]:
     result = request_json(get_client(), method, path, **kwargs)
     if result.get("code") == 401 and st.session_state.get("login"):
@@ -975,6 +990,25 @@ def live_ai_task_panel() -> None:
         st.success("AI 命题已完成并通过自动校验")
         result = data["result"]
         problem = result.get("problem", {})
+        validation = result.get("validation") or {}
+        calibration = validation.get("output_calibration") or {}
+        if calibration.get("applied"):
+            calibration_count = int(calibration.get("count", 0) or 0)
+            st.info(
+                f"Python/C++ 一致输出已校准 {calibration_count} 个答案；"
+                "下方可核对修改前后内容，导入时采用校准答案。"
+            )
+            with st.expander("查看答案校准明细"):
+                st.dataframe(
+                    output_calibration_rows(validation),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "输入": st.column_config.TextColumn(width="medium"),
+                        "模型原答案": st.column_config.TextColumn(width="medium"),
+                        "校准答案": st.column_config.TextColumn(width="medium"),
+                    },
+                )
         with st.container(border=True):
             st.subheader(f"{problem.get('id', '—')} · {problem.get('title', '未命名题目')}")
             st.caption(
