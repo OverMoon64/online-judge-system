@@ -190,6 +190,21 @@ def output_calibration_rows(validation: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def resource_limit_summary(validation: dict[str, Any]) -> str | None:
+    policy = validation.get("resource_limits") or {}
+    final = policy.get("final") or {}
+    if final.get("time_limit") is None or final.get("memory_limit") is None:
+        return None
+    source_label = {
+        "explicit": "按命题需求指定",
+        "mixed": "指定值与自动评估结合",
+        "automatic": "按难度和算法结构自动评估",
+    }.get(policy.get("source"), "自动评估")
+    reasons = "、".join(str(item) for item in policy.get("reasons") or [])
+    summary = f"资源策略：{source_label} · {final['time_limit']} s · {final['memory_limit']} MB"
+    return f"{summary} · {reasons}" if reasons else summary
+
+
 def resolve_problem_selection(
     problem_ids: list[str], current: str | None, requested: str | None = None
 ) -> str | None:
@@ -1006,6 +1021,9 @@ def live_ai_task_panel() -> None:
         result = data["result"]
         problem = result.get("problem", {})
         validation = result.get("validation") or {}
+        resource_summary = resource_limit_summary(validation)
+        if resource_summary:
+            st.caption(resource_summary)
         calibration = validation.get("output_calibration") or {}
         if calibration.get("applied"):
             calibration_count = int(calibration.get("count", 0) or 0)
