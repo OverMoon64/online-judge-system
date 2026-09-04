@@ -1,0 +1,11 @@
+{
+  "python.defaultInterpreterPath": "${env:HOME}/.venvs/online-judge-system/bin/python",
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": ["tests"],
+  "editor.formatOnSave": true,
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+  "ruff.nativeServer": "on"
+}

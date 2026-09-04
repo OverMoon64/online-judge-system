@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "OJ: backend",
+      "type": "shell",
+      "command": "${env:HOME}/.venvs/online-judge-system/bin/uvicorn app.main:app --reload --port 8000",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "OJ: frontend",
+      "type": "shell",
+      "command": "${env:HOME}/.venvs/online-judge-system/bin/streamlit run frontend/app.py --server.port 8501",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "OJ: test",
+      "type": "shell",
+      "command": "${env:HOME}/.venvs/online-judge-system/bin/pytest -q --cov=app --cov-report=term-missing"
+    },
+    {
+      "label": "OJ: lint",
+      "type": "shell",
+      "command": "${env:HOME}/.venvs/online-judge-system/bin/ruff check ."
+    }
+  ]
+}
