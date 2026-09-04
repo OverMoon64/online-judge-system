@@ -536,8 +536,9 @@ def page_problems() -> None:
                 with st.container(border=True):
                     title_col, state_col, action_col = st.columns([5, 2, 1.2])
                     title_col.markdown(f"### {escape(data['id'])} · {escape(data['title'])}")
-                    metadata = [data.get("difficulty") or "未标注"]
-                    metadata.extend(data.get("tags") or [])
+                    difficulty = data.get("difficulty") or "未标注"
+                    metadata = [difficulty]
+                    metadata.extend(tag for tag in (data.get("tags") or []) if tag != difficulty)
                     title_col.caption(" · ".join(metadata))
                     state_col.caption(overview["state"])
                     if overview["latest_verdict"]:
