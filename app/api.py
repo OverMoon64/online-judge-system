@@ -4,7 +4,7 @@ from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Request
-from sqlalchemy import distinct, func, select
+from sqlalchemy import delete, distinct, func, select
 from sqlalchemy.exc import IntegrityError
 
 from app import ai_service
@@ -307,6 +307,14 @@ async def delete_problem(problem_id: str, session: SessionDep, _: AdminUser) -> 
     problem = await session.get(Problem, problem_id)
     if problem is None:
         raise ApiError(404, "problem not found")
+    submission_ids = list(
+        (
+            await session.scalars(select(Submission.id).where(Submission.problem_id == problem_id))
+        ).all()
+    )
+    for submission_id in submission_ids:
+        await cancel_submission_task(submission_id)
+    await session.execute(delete(AccessLog).where(AccessLog.problem_id == problem_id))
     await session.delete(problem)
     await session.commit()
     return success({"id": problem_id}, "delete success")

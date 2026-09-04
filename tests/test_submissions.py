@@ -140,6 +140,25 @@ async def test_private_and_public_log_access_is_audited(client: httpx.AsyncClien
     assert owner["user_id"] != viewer["user_id"]
 
 
+async def test_deleting_problem_removes_submissions_judge_data_and_access_logs(
+    client: httpx.AsyncClient,
+) -> None:
+    await login(client)
+    await add_sum_problem(client)
+    submission_id = await _submit(client, "a,b=map(int,input().split());print(a+b)")
+    await wait_for_submission(int(submission_id))
+    assert (await client.get(f"/api/submissions/{submission_id}/log")).status_code == 200
+    before = await client.get("/api/logs/access/?problem_id=sum_2")
+    assert len(before.json()["data"]) == 1
+
+    deleted = await client.delete("/api/problems/sum_2")
+    assert deleted.status_code == 200
+    assert (await client.get("/api/problems/sum_2")).status_code == 404
+    assert (await client.get(f"/api/submissions/{submission_id}")).status_code == 404
+    after = await client.get("/api/logs/access/?problem_id=sum_2")
+    assert after.json()["data"] == []
+
+
 async def test_memory_limit_and_reset(client: httpx.AsyncClient) -> None:
     await login(client)
     await add_sum_problem(client, memory_limit=20, time_limit=2.0)
