@@ -219,7 +219,6 @@ def parse_json_list(value: str, field: str) -> list[Any] | None:
 
 def page_account() -> None:
     st.title("账户中心")
-    st.caption("使用后端签名 Session Cookie 保持登录状态，所有权限由后端接口校验。")
     login = st.session_state.get("login")
     if not login:
         login_tab, register_tab = st.tabs(["登录账户", "注册账户"])
@@ -268,7 +267,6 @@ def page_account() -> None:
         return
 
     st.markdown(f"### {escape(login['username'])}")
-    st.caption(f"当前角色：{role_label(login['role'])} · 用户 ID：{login['user_id']}")
     with st.spinner("正在读取账户资料……"):
         profile = api_call("GET", f"/api/users/{login['user_id']}", quiet=True)
     if profile.get("code") != 200:
@@ -290,7 +288,6 @@ def page_account() -> None:
         right.markdown(f"**用户 ID**  \n{data['user_id']}")
 
     with st.expander("修改登录密码"):
-        st.caption("修改后当前登录保持有效；下次登录请使用新密码。")
         with st.form("change_password_form", clear_on_submit=True):
             current_password = st.text_input("当前密码 *", type="password")
             new_password = st.text_input("新密码 *", type="password", help="至少 6 位，最长 256 位")
@@ -507,16 +504,20 @@ def page_problems() -> None:
     if not login:
         return
     st.title("题库与评测")
-    st.caption("题目信息与代码提交位于同一工作台；提交历史和详情在顶部“提交记录”中查看。")
     result = api_call("GET", "/api/problems/", quiet=True)
     problems = (result.get("data") or []) if result.get("code") == 200 else []
+    sections = ["题库", "题目详情与提交", "新增题目", "编辑题目"]
     pending_section = st.session_state.pop("next_problem_section", None)
     if pending_section:
-        st.session_state.problem_section = pending_section
+        st.session_state.problem_section = {
+            "题库概览": "题库",
+            "题目与提交": "题目详情与提交",
+        }.get(pending_section, pending_section)
+    if st.session_state.get("problem_section") not in sections:
+        st.session_state.problem_section = "题库"
     section = st.segmented_control(
         "题库功能",
-        ["题目与提交", "题库概览", "新增题目", "编辑题目"],
-        default="题目与提交",
+        sections,
         key="problem_section",
         selection_mode="single",
         required=True,
@@ -524,36 +525,33 @@ def page_problems() -> None:
         label_visibility="collapsed",
     )
 
-    if section == "题目与提交":
-        render_problem_workspace()
-    elif section == "题库概览":
+    if section == "题库":
         if not problems:
-            st.info("题库目前为空，可切换到“新增题目”创建第一道题。")
+            st.info("暂无题目。")
         else:
             with st.spinner("正在整理题目与个人通过状态……"):
                 overviews = load_problem_overviews(problems, login)
-            rows = [
-                {
-                    "状态": overview["state"],
-                    "题号": overview["detail"]["id"],
-                    "题目": overview["detail"]["title"],
-                    "难度": overview["detail"].get("difficulty") or "未标注",
-                    "标签": "、".join(overview["detail"].get("tags") or []) or "—",
-                    "提交次数": overview["attempts"],
-                    "最近结果": (
-                        STATUS_LABELS.get(overview["latest_verdict"], overview["latest_verdict"])
-                        if overview["latest_verdict"]
-                        else "—"
-                    ),
-                }
-                for overview in overviews
-            ]
-            st.dataframe(
-                rows,
-                width="stretch",
-                hide_index=True,
-                column_config={"提交次数": st.column_config.NumberColumn(format="%d 次")},
-            )
+            for overview in overviews:
+                data = overview["detail"]
+                with st.container(border=True):
+                    title_col, state_col, action_col = st.columns([5, 2, 1.2])
+                    title_col.markdown(f"### {escape(data['id'])} · {escape(data['title'])}")
+                    metadata = [data.get("difficulty") or "未标注"]
+                    metadata.extend(data.get("tags") or [])
+                    title_col.caption(" · ".join(metadata))
+                    state_col.caption(overview["state"])
+                    if overview["latest_verdict"]:
+                        state_col.markdown(
+                            status_badge(overview["latest_verdict"]), unsafe_allow_html=True
+                        )
+                    else:
+                        state_col.write(f"提交 {overview['attempts']} 次")
+                    if action_col.button(
+                        "进入题目", key=f"open_problem_{data['id']}", width="stretch"
+                    ):
+                        st.session_state.submit_problem_id = data["id"]
+                        st.session_state.next_problem_section = "题目详情与提交"
+                        st.rerun()
             if login["role"] == "admin":
                 choices = {
                     f"{overview['detail']['id']} · {overview['detail']['title']}": overview
@@ -590,7 +588,8 @@ def page_problems() -> None:
                         if deleted.get("code") == 200:
                             set_flash("success", "题目已删除。")
                             st.rerun()
-
+    elif section == "题目详情与提交":
+        render_problem_workspace()
     elif section == "新增题目":
         draft = st.session_state.get("ai_problem_draft")
         if draft:
@@ -601,7 +600,7 @@ def page_problems() -> None:
                 created = api_call("POST", "/api/problems/", json=payload)
             if created.get("code") == 200:
                 st.session_state.pop("ai_problem_draft", None)
-                st.session_state.next_problem_section = "题库概览"
+                st.session_state.next_problem_section = "题库"
                 set_flash("success", f"题目 {payload['id']} 已创建。")
                 st.rerun()
     elif section == "编辑题目":
@@ -737,7 +736,6 @@ def render_problem_workspace() -> None:
     login = require_login()
     if not login:
         return
-    st.caption("选择题目后可在题面下方直接编写和提交代码；每位用户每分钟最多提交 3 次。")
     problem_result = api_call("GET", "/api/problems/", quiet=True)
     language_result = api_call("GET", "/api/languages/", quiet=True)
     problems = problem_result.get("data") or []
@@ -766,7 +764,6 @@ def render_problem_workspace() -> None:
             editor_title, editor_language = st.columns([3, 1])
             editor_title.markdown("### 提交代码")
             language = editor_language.selectbox("语言 *", languages, key="judge_language")
-            st.caption("支持行号、Tab 缩进、括号补全、语法高亮、查找替换和 VS Code 快捷键。")
             editor_response = code_editor(
                 _starter_code(language),
                 lang=_editor_language(language),
@@ -800,14 +797,11 @@ def render_problem_workspace() -> None:
             code_state_key = f"judge_code_{selected_problem_id}_{language}"
             if editor_response.get("text") is not None:
                 st.session_state[code_state_key] = editor_response.get("text", "")
-            button_col, hint_col = st.columns([1, 4], vertical_alignment="center")
-            button_submitted = button_col.button(
+            button_submitted = st.button(
                 "提交评测",
                 type="primary",
-                width="stretch",
                 key=f"submit_code_{selected_problem_id}_{language}",
             )
-            hint_col.caption("提交后可前往顶部“提交记录”查看源代码与逐测试点结果。")
             submitted = bool(shortcut_submitted or button_submitted)
             if submitted:
                 if shortcut_submitted:
@@ -837,31 +831,25 @@ def page_submission_records() -> None:
     if not login:
         return
     st.title("提交记录")
-    st.caption("筛选历史提交并查看源代码、得分及逐测试点结果。")
     problem_result = api_call("GET", "/api/problems/", quiet=True)
     problems = problem_result.get("data") or []
 
-    st.divider()
-    st.subheader("历史提交")
-    st.caption("不同判题结果使用独立标签和颜色；点击“详情”可查看源代码与每个测试点。")
-    filter_col, status_col, refresh_col = st.columns([2, 2, 1])
+    filter_col, refresh_col = st.columns([4, 1])
     filter_problem = filter_col.selectbox(
         "题目筛选",
         [""] + [item["id"] for item in problems],
         format_func=lambda x: x or "全部题目",
         key="submission_problem_filter",
     )
-    verdict_options = ["", "AC", "WA", "TLE", "MLE", "RE", "CE", "UNK", "pending", "error"]
-    filter_verdict = status_col.selectbox(
-        "判题结果",
-        verdict_options,
-        format_func=lambda value: "全部结果" if not value else STATUS_LABELS.get(value, value),
-        key="submission_verdict_filter",
-    )
     refresh_col.write("")
     refresh_col.write("")
     refresh_col.button("刷新记录", width="stretch")
-    params = {"user_id": login["user_id"], "page_size": 100}
+    filter_signature = filter_problem
+    if st.session_state.get("submission_filter_signature") != filter_signature:
+        st.session_state.submission_filter_signature = filter_signature
+        st.session_state.submission_page = 1
+    current_page = int(st.session_state.get("submission_page", 1))
+    params = {"user_id": login["user_id"], "page": current_page, "page_size": 5}
     if filter_problem:
         params["problem_id"] = filter_problem
     with st.spinner("正在读取提交记录……"):
@@ -871,14 +859,27 @@ def page_submission_records() -> None:
             st.error(records.get("msg", "提交记录加载失败"))
         return
 
+    total = int(records["data"]["total"])
+    total_pages = max(1, (total + 4) // 5)
+    if current_page > total_pages:
+        st.session_state.submission_page = total_pages
+        st.rerun()
     submissions = records["data"]["submissions"]
-    if filter_verdict:
-        submissions = [
-            record for record in submissions if submission_verdict(record) == filter_verdict
-        ]
     if not submissions:
-        st.info("当前筛选条件下没有提交记录。")
+        st.info("暂无提交记录。")
         return
+
+    previous_col, page_col, next_col = st.columns([1, 3, 1], vertical_alignment="center")
+    if previous_col.button("上一页", disabled=current_page <= 1, width="stretch"):
+        st.session_state.submission_page = current_page - 1
+        st.rerun()
+    page_col.markdown(
+        f"<div style='text-align:center'>第 {current_page} / {total_pages} 页 · 共 {total} 条</div>",
+        unsafe_allow_html=True,
+    )
+    if next_col.button("下一页", disabled=current_page >= total_pages, width="stretch"):
+        st.session_state.submission_page = current_page + 1
+        st.rerun()
 
     record_ids = [record["submission_id"] for record in submissions]
     if st.session_state.get("selected_submission_id") not in record_ids:
@@ -1108,8 +1109,6 @@ def page_ai() -> None:
                             set_flash("success", f"模型配置 {item['name']} 已删除。")
                             st.rerun()
                     st.caption(item["provider_url"])
-                    if item.get("pricing_note"):
-                        st.caption(f"计价依据：{item['pricing_note']}")
                     input_col, output_col, cost_col = st.columns(3)
                     input_col.metric("累计输入 Token", usage.get("input_tokens", 0))
                     output_col.metric("累计输出 Token", usage.get("output_tokens", 0))
@@ -1122,13 +1121,6 @@ def page_ai() -> None:
                     )
 
         st.markdown("#### 添加或更新模型")
-        pending_price = st.session_state.pop("pending_ai_price", None)
-        if pending_price:
-            st.session_state.ai_config_input_price = pending_price["input_price"]
-            st.session_state.ai_config_output_price = pending_price["output_price"]
-            st.session_state.ai_config_price_unit = pending_price["price_unit"]
-            st.session_state.ai_config_currency = pending_price["currency"]
-            st.session_state.ai_price_metadata = pending_price
         with st.container(border=True):
             config_name = st.text_input(
                 "配置名称 *", placeholder="例如：百炼主模型", key="ai_config_name"
@@ -1141,32 +1133,6 @@ def page_ai() -> None:
             model = st.text_input(
                 "模型名称 *", placeholder="例如 qwen3.7-plus", key="ai_config_model"
             )
-            auto_price_col, price_help_col = st.columns([1, 4], vertical_alignment="center")
-            if auto_price_col.button("识别官方单价", width="stretch"):
-                if not provider_url.strip() or not model.strip():
-                    st.error("请先填写 Base URL 和模型名称。")
-                else:
-                    pricing = api_call(
-                        "GET",
-                        "/api/ai/model-pricing",
-                        params={"provider_url": provider_url.strip(), "model": model.strip()},
-                        quiet=True,
-                    )
-                    if pricing.get("code") == 200:
-                        detected = dict(pricing["data"])
-                        detected.update(
-                            {"provider_url": provider_url.strip(), "model": model.strip()}
-                        )
-                        st.session_state.pending_ai_price = detected
-                        st.rerun()
-                    else:
-                        st.warning(pricing.get("msg", "无法识别价格，请手动填写。"))
-            price_help_col.caption(
-                "协议没有统一价格接口；已知官方模型可一键带入，其他模型保留手动计价。"
-            )
-            metadata = st.session_state.get("ai_price_metadata") or {}
-            if metadata:
-                st.info(f"{metadata.get('price_source')}：{metadata.get('pricing_note')}")
             api_key = st.text_input("API Key *", type="password", key="ai_config_api_key")
             left, right = st.columns(2)
             input_price = left.number_input(
@@ -1186,11 +1152,6 @@ def page_ai() -> None:
             )
             submitted = st.button("保存配置", type="primary")
         if submitted:
-            price_metadata = st.session_state.get("ai_price_metadata") or {}
-            detected_for_current = (
-                price_metadata.get("provider_url") == provider_url.strip()
-                and price_metadata.get("model") == model.strip()
-            )
             result = api_call(
                 "PUT",
                 "/api/ai/model-config",
@@ -1204,19 +1165,6 @@ def page_ai() -> None:
                     "price_unit": price_unit,
                     "currency": currency,
                     "disable_thinking": disable_thinking,
-                    "price_source": (
-                        price_metadata.get("price_source", "manual")
-                        if detected_for_current
-                        else "manual"
-                    ),
-                    "price_source_url": (
-                        price_metadata.get("price_source_url") if detected_for_current else None
-                    ),
-                    "pricing_note": (
-                        price_metadata.get("pricing_note", "")
-                        if detected_for_current
-                        else "手动计价"
-                    ),
                 },
             )
             if result.get("code") == 200:
@@ -1226,7 +1174,6 @@ def page_ai() -> None:
 
 def render_user_management(login: dict[str, Any]) -> None:
     st.markdown("#### 用户与角色")
-    st.caption("角色入口仅用于改善界面体验，最终权限仍由后端校验。")
     with st.spinner("正在读取用户列表……"):
         result = api_call("GET", "/api/users/?page=1&page_size=100", quiet=True)
     if result.get("code") != 200:
@@ -1277,7 +1224,6 @@ def render_language_management() -> None:
     if current.get("code") == 200:
         names = current["data"]["name"]
         st.info("当前语言：" + ("、".join(names) if names else "暂无"))
-    st.caption("后端使用参数数组执行命令，并校验可执行程序、占位符及危险字符。")
     with st.form("language_form"):
         name = st.text_input("语言名称 *", placeholder="例如 go")
         extension = st.text_input("文件扩展名 *", placeholder="例如 .go")
@@ -1310,7 +1256,6 @@ def render_language_management() -> None:
 
 def render_audit_logs() -> None:
     st.markdown("#### 测试点日志访问审计")
-    st.caption("记录测试点日志的成功与拒绝访问；不存在资源、未登录和参数错误不会写入审计。")
     users_result = api_call("GET", "/api/users/?page=1&page_size=100", quiet=True)
     problems_result = api_call("GET", "/api/problems/", quiet=True)
     users = (users_result.get("data") or {}).get("users", [])
@@ -1415,7 +1360,6 @@ def page_admin() -> None:
     if login["role"] != "admin":
         st.error("该页面仅向管理员显示；所有接口仍会执行后端权限校验。")
         return
-    st.caption("集中管理用户、判题语言、访问审计和课程环境重置。")
     user_tab, language_tab, audit_tab, reset_tab = st.tabs(
         ["用户管理", "语言管理", "审计日志", "系统重置"]
     )
@@ -1455,10 +1399,6 @@ def main() -> None:
     with st.container(key="top_navigation"):
         brand_col, user_col, logout_col = st.columns([5, 2, 1], vertical_alignment="center")
         brand_col.markdown('<div class="oj-brand">⚖️ 在线评测系统</div>', unsafe_allow_html=True)
-        brand_col.markdown(
-            '<div class="oj-muted">课程大作业 2 · Async OJ · 所有操作均通过 REST API</div>',
-            unsafe_allow_html=True,
-        )
         if login:
             user_col.markdown(
                 (
@@ -1471,8 +1411,6 @@ def main() -> None:
             )
             if logout_col.button("退出", width="stretch", type="secondary"):
                 logout_user()
-        else:
-            user_col.caption(f"API：{DEFAULT_API_BASE_URL}")
 
         if len(pages) > 1:
             navigation = st.segmented_control(
