@@ -304,7 +304,7 @@ async def test_ai_refuses_consensus_without_anchor_and_reports_disagreement() ->
         *no_anchor_data["problem"]["samples"],
         *no_anchor_data["problem"]["testcases"],
     ]:
-        case["output"] = ""
+        case["output"] = "definitely-wrong"
     no_anchor = GeneratedProblem.model_validate(no_anchor_data)
     errors, calibration = await ai_service._validate_generated(no_anchor, request, None)
     assert any("不存在与双解结果一致的非空安全锚点" in error for error in errors)
@@ -324,6 +324,89 @@ async def test_ai_refuses_consensus_without_anchor_and_reports_disagreement() ->
     assert any("双解输出不一致" in error for error in errors)
     assert any("Python stdout=" in error and "C++ stdout=" in error for error in errors)
     assert calibration["applied"] is False
+
+
+def test_ai_resource_limits_follow_explicit_request_and_complexity() -> None:
+    explicit_request = AIProblemTaskPayload(
+        requirement="设计一道图搜索题，限制时间为 2.5 秒，空间限制 512 MB",
+        difficulty="困难",
+        knowledge_points=["BFS"],
+    )
+    explicit_generated = GeneratedProblem.model_validate(generated_payload())
+    explicit = ai_service._apply_resource_limit_policy(explicit_generated, explicit_request)
+    assert explicit["source"] == "explicit"
+    assert explicit["final"] == {"time_limit": 2.5, "memory_limit": 512}
+    assert explicit_generated.problem.time_limit == 2.5
+    assert explicit_generated.problem.memory_limit == 512
+    explicit_prompt = ai_service._generation_prompt(explicit_request, "分析", None)
+    assert '"time_limit": 2.5, "memory_limit": 512' in explicit_prompt
+    assert "必须严格为 2.5 秒" in explicit_prompt
+
+    automatic_request = AIProblemTaskPayload(
+        requirement="生成一道大规模网格最短路题，使用 BFS 搜索",
+        difficulty="困难",
+        knowledge_points=["图", "BFS"],
+    )
+    automatic_generated = GeneratedProblem.model_validate(generated_payload())
+    automatic = ai_service._apply_resource_limit_policy(automatic_generated, automatic_request)
+    assert automatic["source"] == "automatic"
+    assert automatic["recommended_minimum"] == {"time_limit": 3.0, "memory_limit": 256}
+    assert automatic["final"] == {"time_limit": 3.0, "memory_limit": 256}
+    assert automatic_generated.problem.time_limit == 3.0
+    assert automatic_generated.problem.memory_limit == 256
+
+
+async def test_ai_repairs_placeholder_test_data_instead_of_reference_solution(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await login(client)
+    await client.put(
+        "/api/ai/model-config",
+        json={
+            "provider_url": "https://example-model-provider.test/v1",
+            "model": "test-data-repair-model",
+            "api_key": "secret",
+        },
+    )
+    valid = generated_payload()
+    invalid = generated_payload()
+    invalid["problem"]["testcases"][1]["input"] = "1000 1000\nGENERATE_FULL_ZERO_GRID"
+    calls = 0
+
+    async def fake_provider(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            content = "边界与资源分析"
+        elif calls == 2:
+            content = json.dumps(invalid, ensure_ascii=False)
+        else:
+            content = json.dumps(
+                {
+                    "samples": valid["problem"]["samples"],
+                    "testcases": valid["problem"]["testcases"],
+                },
+                ensure_ascii=False,
+            )
+        return content, {"input_tokens": 10, "output_tokens": 20}
+
+    monkeypatch.setattr(ai_service, "_provider_request", fake_provider)
+    response = await client.post(
+        "/api/ai/problem-tasks/",
+        json={
+            "requirement": "生成一道包含完整可执行测试输入的三个整数求和题目",
+            "testcase_count": 3,
+        },
+    )
+    task = await _wait_task(client, response.json()["data"]["task_id"])
+
+    assert task["status"] == "completed", task
+    assert calls == 3
+    assert task["usage"]["calls"][-1]["stage"] == "定向修复测试数据 1/2"
+    assert task["result"]["reference_solution"] == valid["reference_solution"]
+    assert task["result"]["reference_solution_cpp"] == valid["reference_solution_cpp"]
+    assert all("GENERATE_" not in case["input"] for case in task["result"]["problem"]["testcases"])
+    assert task["result"]["validation"]["resource_limits"]["source"] == "automatic"
 
 
 @pytest.mark.parametrize("failure_status", ["RE", "TLE", "MLE"])

@@ -8,6 +8,7 @@ from streamlit.testing.v1 import AppTest
 from frontend.app import (
     output_calibration_rows,
     resolve_problem_selection,
+    resource_limit_summary,
     status_badge,
     submission_verdict,
 )
@@ -83,6 +84,23 @@ def test_problem_selection_survives_reruns_and_problem_list_changes() -> None:
     assert resolve_problem_selection(problem_ids, "chosen") == "chosen"
     assert resolve_problem_selection(problem_ids, "missing") == "first"
     assert resolve_problem_selection([], "chosen") is None
+
+
+def test_resource_limit_summary_explains_automatic_decision() -> None:
+    summary = resource_limit_summary(
+        {
+            "resource_limits": {
+                "source": "automatic",
+                "final": {"time_limit": 3.0, "memory_limit": 256},
+                "reasons": ["难度为困难", "需要维护图、网格或状态结构"],
+            }
+        }
+    )
+    assert summary is not None
+    assert "自动评估" in summary
+    assert "3.0 s" in summary
+    assert "256 MB" in summary
+    assert resource_limit_summary({}) is None
 
 
 def test_frontend_initial_account_page_renders() -> None:

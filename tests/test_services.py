@@ -273,6 +273,16 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     assert normalized["problem"]["id"] == "nested"
     assert normalized["reference_solution"] == "print(1)"
     assert normalized["reference_solution_cpp"] == "int main(){}"
+    normalized_cases = ai_service._normalize_generated_payload(
+        {
+            "problem": {
+                "samples": [{"input": 10, "output": 55}],
+                "testcases": [{"input": 100000}],
+            }
+        }
+    )["problem"]
+    assert normalized_cases["samples"] == [{"input": "10", "output": "55"}]
+    assert normalized_cases["testcases"] == [{"input": "100000", "output": ""}]
 
     total = ai_service._empty_usage(_config())
     ai_service._merge_usage(total, {"input_tokens": 100, "output_tokens": 50}, _config())
