@@ -37,6 +37,7 @@ from app.judge import (
 from app.schemas import (
     AIModelConfigPayload,
     AIProblemTaskPayload,
+    ChangePasswordPayload,
     LanguagePayload,
     LoginPayload,
     LogVisibilityPayload,
@@ -227,6 +228,23 @@ async def get_user(user_id: str, session: SessionDep, current_user: CurrentUser)
     if user is None:
         raise ApiError(404, "user not found")
     return success(await _user_data(session, user))
+
+
+@router.put("/api/users/{user_id}/password")
+async def change_password(
+    user_id: str, request: Request, session: SessionDep, current_user: CurrentUser
+) -> dict[str, Any]:
+    parsed_id = parse_resource_id(user_id, "user_id")
+    if current_user.id != parsed_id:
+        raise ApiError(403, "permission denied")
+    payload = await parse_body(request, ChangePasswordPayload)
+    if not await verify_password(payload.current_password, current_user.password_hash):
+        raise ApiError(400, "invalid current password")
+    if payload.current_password == payload.new_password:
+        raise ApiError(400, "new password must be different")
+    current_user.password_hash = await hash_password(payload.new_password)
+    await session.commit()
+    return success(None, "password updated")
 
 
 @router.put("/api/users/{user_id}/role")

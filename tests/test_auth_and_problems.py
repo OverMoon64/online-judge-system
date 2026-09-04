@@ -45,6 +45,39 @@ async def test_registration_login_roles_and_statistics(client: httpx.AsyncClient
     assert (await login(client, "alice")).status_code == 403
 
 
+async def test_change_password_requires_owner_and_current_password(
+    client: httpx.AsyncClient,
+) -> None:
+    alice = await register(client, "alice")
+    bob = await register(client, "bob")
+    await login(client, "alice")
+
+    forbidden = await client.put(
+        f"/api/users/{bob['user_id']}/password",
+        json={"current_password": "password123", "new_password": "new-password123"},
+    )
+    assert forbidden.status_code == 403
+    wrong_current = await client.put(
+        f"/api/users/{alice['user_id']}/password",
+        json={"current_password": "wrong-password", "new_password": "new-password123"},
+    )
+    assert wrong_current.status_code == 400
+    unchanged = await client.put(
+        f"/api/users/{alice['user_id']}/password",
+        json={"current_password": "password123", "new_password": "password123"},
+    )
+    assert unchanged.status_code == 400
+
+    changed = await client.put(
+        f"/api/users/{alice['user_id']}/password",
+        json={"current_password": "password123", "new_password": "new-password123"},
+    )
+    assert changed.status_code == 200
+    await client.post("/api/auth/logout")
+    assert (await login(client, "alice")).status_code == 401
+    assert (await login(client, "alice", "new-password123")).status_code == 200
+
+
 async def test_validation_pagination_and_permission_priority(
     client: httpx.AsyncClient,
 ) -> None:
@@ -98,3 +131,17 @@ async def test_problem_crud_defaults_and_language_safety(client: httpx.AsyncClie
     deleted = await client.delete("/api/problems/sum_2")
     assert deleted.status_code == 200
     assert (await client.get("/api/problems/sum_2")).status_code == 404
+
+
+async def test_regular_user_can_create_and_edit_problem(client: httpx.AsyncClient) -> None:
+    await register(client, "author")
+    await login(client, "author")
+    payload = await add_sum_problem(client)
+    assert (await client.get("/api/problems/sum_2")).status_code == 200
+
+    payload["title"] = "普通用户维护的 A+B"
+    updated = await client.put("/api/problems/sum_2", json=payload)
+    assert updated.status_code == 200
+    detail = (await client.get("/api/problems/sum_2")).json()["data"]
+    assert detail["title"] == "普通用户维护的 A+B"
+    assert (await client.delete("/api/problems/sum_2")).status_code == 403
