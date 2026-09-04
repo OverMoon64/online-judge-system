@@ -78,6 +78,27 @@ async def _user_data(session: SessionDep, user: User) -> dict[str, Any]:
     }
 
 
+def _submission_result(submission: Submission) -> str:
+    if submission.status == "pending":
+        return "pending"
+    if submission.status == "error":
+        return "UNK"
+
+    supported_results = {"AC", "WA", "TLE", "MLE", "RE", "CE", "UNK"}
+    details = submission.details or []
+    for case in details:
+        result = str(case.get("result", "UNK")).upper()
+        if result != "AC":
+            return result if result in supported_results else "UNK"
+    if details:
+        return "AC"
+    if submission.compile_info and submission.compile_info.get("result") == "failed":
+        return "CE"
+    if submission.counts and submission.score == submission.counts:
+        return "AC"
+    return "UNK"
+
+
 def _submission_detail(submission: Submission, *, include_code: bool = False) -> dict[str, Any]:
     data: dict[str, Any] = {
         "submission_id": str(submission.id),
@@ -85,6 +106,7 @@ def _submission_detail(submission: Submission, *, include_code: bool = False) ->
         "problem_id": submission.problem_id,
         "language": submission.language,
         "created_at": submission.created_at.isoformat(),
+        "result": _submission_result(submission),
     }
     if include_code:
         data["code"] = submission.code

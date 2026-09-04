@@ -34,6 +34,7 @@ async def test_python_judging_logs_rejudge_and_stats(client: httpx.AsyncClient) 
     assert result["language"] == "python"
     assert "map(int, input().split())" in result["code"]
     assert result["score"] == result["counts"] == 30
+    assert result["result"] == "AC"
     assert result["compile_info"] is None
 
     log = (await client.get(f"/api/submissions/{submission_id}/log")).json()["data"]
@@ -44,6 +45,7 @@ async def test_python_judging_logs_rejudge_and_stats(client: httpx.AsyncClient) 
     assert profile["resolve_count"] == 1
     listing = await client.get(f"/api/submissions/?user_id={alice['user_id']}")
     assert listing.json()["data"]["submissions"][0]["score"] == 30
+    assert listing.json()["data"]["submissions"][0]["result"] == "AC"
 
     await client.post("/api/auth/logout")
     await login(client)
@@ -77,7 +79,9 @@ async def test_wrong_answer_runtime_error_timeout_and_rate_limit(
         await wait_for_submission(int(submission_id))
     outcomes = []
     for submission_id in ids:
+        detail = (await client.get(f"/api/submissions/{submission_id}")).json()["data"]
         log = (await client.get(f"/api/submissions/{submission_id}/log")).json()["data"]
+        assert detail["result"] == log["details"][0]["result"]
         outcomes.append(log["details"][0]["result"])
     assert outcomes == ["WA", "RE", "TLE"]
 
@@ -100,6 +104,8 @@ async def test_cpp_compilation_success_and_failure(client: httpx.AsyncClient) ->
     assert success_result["compile_info"]["result"] == "success"
     failure_log = (await client.get(f"/api/submissions/{failure_id}/log")).json()["data"]
     assert {case["result"] for case in failure_log["details"]} == {"CE"}
+    failure_result = (await client.get(f"/api/submissions/{failure_id}")).json()["data"]
+    assert failure_result["result"] == "CE"
 
 
 async def test_private_and_public_log_access_is_audited(client: httpx.AsyncClient) -> None:
@@ -143,6 +149,8 @@ async def test_memory_limit_and_reset(client: httpx.AsyncClient) -> None:
     await wait_for_submission(int(submission_id), timeout=10)
     log = (await client.get(f"/api/submissions/{submission_id}/log")).json()["data"]
     assert log["details"][0]["result"] in {"MLE", "RE"}
+    detail = (await client.get(f"/api/submissions/{submission_id}")).json()["data"]
+    assert detail["result"] in {"MLE", "RE"}
 
     reset = await client.post("/api/reset/")
     assert reset.status_code == 200

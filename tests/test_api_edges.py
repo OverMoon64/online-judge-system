@@ -115,6 +115,7 @@ async def test_problem_only_submission_filter_and_audit_pagination(
     submission_id = response.json()["data"]["submission_id"]
     pending = await client.get(f"/api/submissions/{submission_id}")
     assert set(pending.json()["data"]) >= {"submission_id", "status"}
+    assert pending.json()["data"]["result"] == "pending"
     await wait_for_submission(int(submission_id))
     listing = await client.get("/api/submissions/?problem_id=sum_2&page=1&page_size=10")
     assert listing.json()["data"]["total"] == 1
