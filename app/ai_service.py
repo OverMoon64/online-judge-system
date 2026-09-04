@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import math
 import re
 import uuid
 from base64 import urlsafe_b64encode
@@ -16,12 +17,18 @@ from urllib.parse import urlparse
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from app import db as database
 from app.config import get_settings
 from app.db import AIProblemTask, Problem, utc_now
-from app.judge import ReferenceExecution, execute_reference_solution, normalize_output
-from app.schemas import AIModelConfigPayload, AIProblemTaskPayload, GeneratedProblem
+from app.judge import (
+    ReferenceExecution,
+    execute_input_generator,
+    execute_reference_solution,
+    normalize_output,
+)
+from app.schemas import AIModelConfigPayload, AIProblemTaskPayload, GeneratedProblem, TestCase
 
 _model_configs: dict[int, dict[str, AIModelConfigPayload]] = {}
 _active_model_configs: dict[int, str] = {}
@@ -29,6 +36,8 @@ _model_usage: dict[int, dict[str, dict[str, Any]]] = {}
 _model_store_path_override: Path | None = None
 _model_store_loaded = False
 _model_store_lock: asyncio.Lock | None = None
+_ai_id_lock: asyncio.Lock | None = None
+_reserved_ai_ids: set[str] = set()
 _running_tasks: dict[str, asyncio.Task[None]] = {}
 StreamCallback = Callable[[str], Awaitable[None]]
 
@@ -75,6 +84,13 @@ def _get_store_lock() -> asyncio.Lock:
     if _model_store_lock is None:
         _model_store_lock = asyncio.Lock()
     return _model_store_lock
+
+
+def _get_ai_id_lock() -> asyncio.Lock:
+    global _ai_id_lock
+    if _ai_id_lock is None:
+        _ai_id_lock = asyncio.Lock()
+    return _ai_id_lock
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
@@ -553,6 +569,9 @@ def _normalize_generated_payload(value: dict[str, Any]) -> dict[str, Any]:
         "reference_solution": ("python_solution", "reference_solution_python"),
         "reference_solution_cpp": ("cpp_solution", "cxx_solution"),
         "solution_explanation": ("explanation",),
+        "stress_test_generator": ("testcase_generator", "input_generator"),
+        "complexity_probe_solution": ("brute_force_solution", "slow_solution"),
+        "complexity_contract": ("complexity", "complexity_requirements"),
     }
     if not isinstance(problem, dict) and {"id", "title", "description"}.issubset(normalized):
         problem = {
@@ -608,6 +627,15 @@ _memory_limit_pattern = re.compile(
 _test_input_placeholder_pattern = re.compile(
     r"(?:^|\s)\.\.\.(?:\s|$)|…|\bomitted\b|\bplaceholder\b|"
     r"\bgenerate_[a-z0-9_]+\b|generated\s+by\s+(?:the\s+)?ref|省略|占位|待生成",
+    flags=re.IGNORECASE,
+)
+_unsafe_generator_pattern = re.compile(
+    r"\b(?:import|from)\s+(?:os|subprocess|socket|pathlib|httpx|requests|urllib)\b|"
+    r"\bopen\s*\(|\b(?:eval|exec|compile|__import__)\s*\(",
+    flags=re.IGNORECASE,
+)
+_artificial_probe_delay_pattern = re.compile(
+    r"\bwhile\s+(?:True|1)\s*:|\b(?:time\.)?sleep\s*\(",
     flags=re.IGNORECASE,
 )
 
@@ -758,20 +786,213 @@ def _resource_limit_instruction(request: AIProblemTaskPayload) -> str:
     )
 
 
+def _requires_complexity_stress(request: AIProblemTaskPayload) -> bool:
+    context = " ".join([request.requirement, request.difficulty, *request.knowledge_points]).lower()
+    keywords = (
+        "复杂度",
+        "大数据",
+        "最大规模",
+        "暴力",
+        "性能",
+        "超时",
+        "卡掉",
+        "优化",
+        "最优算法",
+        "复杂搜索",
+        "状态压缩",
+        "网络流",
+        "complexity",
+        "stress",
+        "brute force",
+        "tle",
+    )
+    return request.difficulty == "困难" or any(keyword in context for keyword in keywords)
+
+
+def _complexity_instruction(request: AIProblemTaskPayload) -> str:
+    required = _requires_complexity_stress(request)
+    if not required:
+        return (
+            "本题未明确要求淘汰低效算法，stress_test_generator、complexity_probe_solution "
+            "可返回空字符串，complexity_contract 可返回空对象；不要为普通题额外制造压力验证。"
+        )
+    return (
+        "本题明确要求验证复杂度，以下三个字段均为必填：stress_test_generator 是完整 "
+        "Python 3 标准库程序，固定随机种子，"
+        "运行后只输出 JSON 数组；每项格式为 "
+        '{"label":"压力点说明","scale":主规模整数,"input":"完整标准输入"}。'
+        "生成器应在本地构造 1–3 个接近数据范围上界的隐藏压力点，禁止联网、读取文件或输出答案；"
+        "总输入不超过 800000 字符。complexity_probe_solution 是一份答案正确但采用题目明确要淘汰的"
+        "较低时间/空间复杂度的完整 Python 程序，它必须通过小样例，但应在压力点上 TLE 或 MLE。"
+        "complexity_contract 必须写明 expected_time_complexity、expected_space_complexity、"
+        "forbidden_time_complexities 和 stress_rationale。"
+    )
+
+
+async def _materialize_stress_cases(
+    generated: GeneratedProblem,
+    request: AIProblemTaskPayload,
+) -> tuple[GeneratedProblem, list[str], dict[str, Any]]:
+    required = _requires_complexity_stress(request)
+    metadata: dict[str, Any] = {
+        "required": required,
+        "generated": False,
+        "base_testcase_count": len(generated.problem.testcases),
+        "stress_testcase_indexes": [],
+        "items": [],
+    }
+    errors: list[str] = []
+    if not required:
+        return generated, errors, metadata
+    contract = generated.complexity_contract
+    if required:
+        if not generated.stress_test_generator.strip():
+            errors.append("复杂度压力 缺少 stress_test_generator，无法构造大规模隐藏测试点")
+        if not generated.complexity_probe_solution.strip():
+            errors.append("复杂度压力 缺少 complexity_probe_solution，无法证明暴力解会被淘汰")
+        if not contract.expected_time_complexity.strip():
+            errors.append("复杂度压力 缺少期望时间复杂度")
+        if not contract.expected_space_complexity.strip():
+            errors.append("复杂度压力 缺少期望空间复杂度")
+        if not contract.forbidden_time_complexities:
+            errors.append("复杂度压力 缺少需要淘汰的复杂度列表")
+        if not contract.stress_rationale.strip():
+            errors.append("复杂度压力 缺少压力点规模选择依据")
+    if not generated.stress_test_generator.strip():
+        return generated, errors, metadata
+
+    unsafe_generator = _unsafe_generator_pattern.search(generated.stress_test_generator)
+    if unsafe_generator:
+        errors.append(f"复杂度压力 压力数据生成器包含禁用操作 {unsafe_generator.group(0)!r}")
+        return generated, errors, metadata
+
+    execution = await execute_input_generator(generated.stress_test_generator)
+    metadata["generator_status"] = execution.status
+    metadata["generator_time"] = round(execution.elapsed, 4)
+    metadata["generator_memory"] = round(execution.peak_memory_mb, 3)
+    if execution.status != "OK":
+        detail = execution.stderr or execution.stdout or execution.status
+        errors.append(f"复杂度压力 压力数据生成器运行失败：{detail[:500]}")
+        return generated, errors, metadata
+    try:
+        raw_cases = json.loads(execution.stdout)
+    except json.JSONDecodeError as exc:
+        errors.append(f"复杂度压力 压力数据生成器必须输出 JSON 数组：{exc}")
+        return generated, errors, metadata
+    if not isinstance(raw_cases, list) or not 1 <= len(raw_cases) <= 3:
+        errors.append("复杂度压力 压力数据生成器必须输出 1 到 3 个测试点")
+        return generated, errors, metadata
+
+    materialized = generated.model_copy(deep=True)
+    known_inputs = {case.input for case in materialized.problem.testcases}
+    total_size = 0
+    start_index = len(materialized.problem.testcases)
+    for index, raw_case in enumerate(raw_cases, start=1):
+        if isinstance(raw_case, str):
+            input_text = raw_case
+            label = f"压力点 {index}"
+            scale = None
+        elif isinstance(raw_case, dict):
+            input_text = raw_case.get("input")
+            label = str(raw_case.get("label") or f"压力点 {index}")[:120]
+            scale = raw_case.get("scale")
+        else:
+            errors.append(f"复杂度压力 压力点 {index} 必须是字符串或对象")
+            continue
+        if not isinstance(input_text, str) or not input_text.strip():
+            errors.append(f"复杂度压力 压力点 {index} 缺少完整 input 字符串")
+            continue
+        if len(input_text) > 300_000:
+            errors.append(f"复杂度压力 压力点 {index} 超过 300000 字符")
+            continue
+        total_size += len(input_text)
+        placeholder = _test_input_placeholder_pattern.search(input_text)
+        if placeholder:
+            errors.append(f"复杂度压力 压力点 {index} 含占位内容 {placeholder.group(0)!r}")
+            continue
+        if input_text in known_inputs:
+            errors.append(f"复杂度压力 压力点 {index} 与已有测试输入重复")
+            continue
+        if scale is not None and (not isinstance(scale, int) or scale <= 0):
+            errors.append(f"复杂度压力 压力点 {index} 的 scale 必须是正整数")
+            continue
+        known_inputs.add(input_text)
+        materialized.problem.testcases.append(TestCase(input=input_text, output=""))
+        metadata["items"].append(
+            {"label": label, "scale": scale, "input_bytes": len(input_text.encode("utf-8"))}
+        )
+    if total_size > 800_000:
+        errors.append("复杂度压力 压力测试输入总长度超过 800000 字符")
+    if len(materialized.problem.testcases) > 10:
+        errors.append("复杂度压力 普通测试点与压力测试点合计不得超过 10 个")
+    stress_count = len(materialized.problem.testcases) - start_index
+    metadata["generated"] = stress_count > 0
+    metadata["stress_testcase_indexes"] = list(
+        range(start_index, len(materialized.problem.testcases))
+    )
+    return materialized, errors, metadata
+
+
+async def _allocate_ai_problem_id() -> str:
+    async with _get_ai_id_lock():
+        async with database.session_factory() as session:
+            ids = set((await session.scalars(select(Problem.id))).all())
+            completed_results = list(
+                (
+                    await session.scalars(
+                        select(AIProblemTask.result).where(AIProblemTask.status == "completed")
+                    )
+                ).all()
+            )
+        ids.update(_reserved_ai_ids)
+        for result in completed_results:
+            if isinstance(result, dict):
+                problem = result.get("problem")
+                if isinstance(problem, dict) and isinstance(problem.get("id"), str):
+                    ids.add(problem["id"])
+        sequence = [
+            int(match.group(1))
+            for problem_id in ids
+            if (match := re.fullmatch(r"AI(\d{4,})", problem_id, flags=re.IGNORECASE))
+        ]
+        allocated = f"AI{max(sequence, default=0) + 1:04d}"
+        _reserved_ai_ids.add(allocated)
+        return allocated
+
+
 def _generation_prompt(
     request: AIProblemTaskPayload, blueprint: str, existing: dict[str, Any] | None
 ) -> str:
     existing_text = json.dumps(existing, ensure_ascii=False)[:8_000] if existing else "无"
-    testcase_requirement = (
-        f"生成至少 {request.testcase_count} 个互不重复的隐藏测试点"
-        if request.testcase_count
-        else "根据算法复杂度、边界规模和预计运行时长，生成 2 到 10 个互不重复的隐藏测试点"
-    )
+    requires_stress = _requires_complexity_stress(request)
+    if requires_stress and request.testcase_count:
+        testcase_requirement = (
+            f"最终隐藏测试点总数至少为 {request.testcase_count} 且不超过 10；"
+            "主 JSON 只放小型/普通测试点，并为本地生成的 1–3 个压力点预留数量"
+        )
+    elif requires_stress:
+        testcase_requirement = (
+            "最终生成 2 到 10 个互不重复的隐藏测试点；主 JSON 最多放 7 个普通点，"
+            "另由本地压力生成器补充 1–3 个大规模点"
+        )
+    elif request.testcase_count:
+        testcase_requirement = f"生成至少 {request.testcase_count} 个互不重复的隐藏测试点"
+    else:
+        testcase_requirement = (
+            "根据算法复杂度、边界规模和预计运行时长，生成 2 到 10 个互不重复的隐藏测试点"
+        )
     resource_requirement = _resource_limit_instruction(request)
+    complexity_requirement = _complexity_instruction(request)
     prompt_time, prompt_memory, _ = _recommended_resource_limits(request)
     explicit_time, explicit_memory = _explicit_resource_limits(request.requirement)
     prompt_time = explicit_time if explicit_time is not None else prompt_time
     prompt_memory = explicit_memory if explicit_memory is not None else prompt_memory
+    prompt_id = str(existing.get("id")) if existing else "AUTO"
+    id_instruction = (
+        f"本任务修改已有题目，id 必须保持为 {prompt_id}。"
+        if existing
+        else "新题 id 统一由系统在校验通过后分配为 AI0001、AI0002……；此处固定填写 AUTO。"
+    )
     return f"""
 你是程序设计训练课程的严谨命题专家。请根据命题需求和分析草案生成一道可直接导入 OJ 的题目。
 
@@ -786,7 +1007,7 @@ def _generation_prompt(
 只返回一个 JSON 对象，禁止 Markdown。格式必须为：
 {{
   "problem": {{
-    "id": "唯一英文或数字编号", "title": "标题", "description": "题面",
+    "id": "{prompt_id}", "title": "标题", "description": "题面",
     "input_description": "输入格式", "output_description": "输出格式",
     "samples": [{{"input": "...", "output": "..."}}],
     "constraints": "数据范围", "testcases": [{{"input": "...", "output": "..."}}],
@@ -796,8 +1017,17 @@ def _generation_prompt(
   }},
     "reference_solution": "完整 Python 3 程序，换行必须写成 JSON 转义字符 \\n",
     "reference_solution_cpp": "完整 C++14 程序，换行必须写成 JSON 转义字符 \\n",
-  "solution_explanation": "正确性和复杂度说明"
+  "solution_explanation": "正确性和复杂度说明",
+  "stress_test_generator": "确定性 Python 压力输入生成器；输出 JSON 数组",
+  "complexity_probe_solution": "答案正确但复杂度较低、应被压力点淘汰的 Python 程序",
+  "complexity_contract": {{
+    "expected_time_complexity": "O(...) / Θ(...)",
+    "expected_space_complexity": "O(...) / Θ(...)",
+    "forbidden_time_complexities": ["O(...)"],
+    "stress_rationale": "最大规模与淘汰低效算法的依据"
+  }}
 }}
+{id_instruction}
 两个参考程序必须使用相同算法并对所有 output 给出一致结果；Python 只能使用标准库，C++ 使用 C++14。
 若题目涉及递推数列，必须在题面和解法中明确 F(0)/F(1) 或 F(1)/F(2) 等下标定义。
 至少提供一个答案可人工核对的小规模样例，且该样例 output 必须准确且非空，作为题意安全锚点。
@@ -808,7 +1038,9 @@ input 字段必须包含完整的字面输入数据，严禁使用省略号、GE
 “omitted for brevity”“由参考程序生成”等描述或宏。若完整大矩阵/长序列超过长度限制，
 应使用规模较小但结构有效的完整数据；只有题目输入格式本身定义了种子或紧凑表示时才能使用它。
 每个测试点的 input 和 output 均不得超过 2000 字符。大规模边界应使用紧凑的数字输入，
-不要展开数千个重复字符，也不要为了淘汰低效算法而生成超长字面量。整个 JSON 应简洁完整。
+不要在主 JSON 中展开数千个重复字符。真正的大规模隐藏测试必须由 stress_test_generator 在本地展开，
+不能用小输入冒充压力测试。{complexity_requirement}
+整个 JSON 应简洁完整。
 所有字符串中的换行、制表符和控制字符都必须按 JSON 规则转义，禁止输出字面控制字符。
 """.strip()
 
@@ -853,16 +1085,48 @@ def _test_data_repair_prompt(
     )
 
 
-async def _validate_generated(
+def _complexity_repair_prompt(
+    generated: GeneratedProblem,
+    request: AIProblemTaskPayload,
+    *,
+    errors: list[str],
+    base_testcase_count: int,
+) -> str:
+    problem = generated.problem.model_dump(mode="json")
+    problem["testcases"] = problem.get("testcases", [])[:base_testcase_count]
+    return (
+        "只强化复杂度压力验证，不得修改题面、普通测试点、参考解法或样例。"
+        "只返回严格 JSON 对象，且只能包含 stress_test_generator、"
+        "complexity_probe_solution、complexity_contract 三个根字段。\n"
+        f"命题需求：{request.requirement}\n"
+        f"题目契约：{json.dumps(problem, ensure_ascii=False)}\n"
+        f"Python 正解：{generated.reference_solution}\n"
+        f"C++ 正解：{generated.reference_solution_cpp}\n"
+        "生成器必须使用固定随机种子，在 3 秒/256 MB 内输出 1–3 个 JSON 压力输入对象，"
+        "单点不超过 300000 字符、总计不超过 800000 字符。压力规模必须足以让低效探针在"
+        "当前题目时空限制下得到 TLE 或 MLE；探针必须通过小样例，不能靠错误答案、异常或死循环伪造淘汰。\n"
+        f"校验错误：{'; '.join(errors[:20])}"
+    )
+
+
+def _static_validation_errors(
     generated: GeneratedProblem,
     request: AIProblemTaskPayload,
     existing: dict[str, Any] | None,
-) -> tuple[list[str], dict[str, Any]]:
-    calibration: dict[str, Any] = {"applied": False, "count": 0, "items": []}
+    *,
+    stress_testcase_indexes: set[int] | None = None,
+) -> list[str]:
+    stress_materialized = stress_testcase_indexes is not None
+    stress_indexes = stress_testcase_indexes or set()
     errors: list[str] = []
-    if not 2 <= len(generated.problem.testcases) <= 10:
+    minimum_count = 2 if stress_materialized or not _requires_complexity_stress(request) else 1
+    if not minimum_count <= len(generated.problem.testcases) <= 10:
         errors.append("测试数据 隐藏测试点数量必须在 2 到 10 之间")
-    elif request.testcase_count and len(generated.problem.testcases) < request.testcase_count:
+    elif (
+        request.testcase_count
+        and (stress_materialized or not _requires_complexity_stress(request))
+        and len(generated.problem.testcases) < request.testcase_count
+    ):
         errors.append(f"测试数据 测试点少于要求的 {request.testcase_count} 个")
     inputs = [case.input for case in generated.problem.testcases]
     if len(set(inputs)) != len(inputs):
@@ -876,10 +1140,15 @@ async def _validate_generated(
         ("样例", generated.problem.samples),
         ("测试点", generated.problem.testcases),
     ):
-        for index, case in enumerate(cases, start=1):
+        for zero_index, case in enumerate(cases):
+            index = zero_index + 1
             total_test_data_length += len(case.input) + len(case.output)
-            if len(case.input) > 2_000:
-                errors.append(f"测试数据 {kind} {index} 输入超过 2000 字符，请改为紧凑数据")
+            is_stress = kind == "测试点" and zero_index in stress_indexes
+            input_limit = 300_000 if is_stress else 2_000
+            if len(case.input) > input_limit:
+                errors.append(
+                    f"测试数据 {kind} {index} 输入超过 {input_limit} 字符，请改为紧凑数据"
+                )
             if len(case.output) > 4_000:
                 errors.append(f"测试数据 {kind} {index} 输出过长，请简化题目或测试数据")
             placeholder = _test_input_placeholder_pattern.search(case.input)
@@ -888,10 +1157,166 @@ async def _validate_generated(
                     f"测试数据 {kind} {index} 含占位或省略内容 {placeholder.group(0)!r}；"
                     "input 必须是可以直接传给标准输入的完整字面数据"
                 )
-    if total_test_data_length > 16_000:
-        errors.append("测试数据 总长度超过 16000 字符，请减少冗余并使用完整紧凑输入")
+    total_limit = 800_000 if stress_indexes else 16_000
+    if total_test_data_length > total_limit:
+        errors.append(f"测试数据 总长度超过 {total_limit} 字符，请减少冗余")
     if existing and generated.problem.id != existing.get("id"):
         errors.append("修改已有题目时不得改变题目 id")
+    return errors
+
+
+def _tune_resources_from_reference_runs(
+    generated: GeneratedProblem,
+    request: AIProblemTaskPayload,
+    python_execution: ReferenceExecution,
+    cpp_execution: ReferenceExecution,
+    stress_testcase_indexes: set[int],
+) -> dict[str, Any]:
+    before = {
+        "time_limit": generated.problem.time_limit,
+        "memory_limit": generated.problem.memory_limit,
+    }
+    if not stress_testcase_indexes:
+        return {"applied": False, "before": before, "final": before}
+    result_indexes = [
+        len(generated.problem.samples) + index for index in sorted(stress_testcase_indexes)
+    ]
+    reference_results = [
+        execution.results[index]
+        for execution in (python_execution, cpp_execution)
+        for index in result_indexes
+    ]
+    max_time = max((result.elapsed for result in reference_results), default=0.0)
+    max_memory = max((result.peak_memory_mb for result in reference_results), default=0.0)
+    explicit_time, explicit_memory = _explicit_resource_limits(request.requirement)
+    if explicit_time is None:
+        measured_time_limit = max(0.5, math.ceil((max_time * 6 + 0.1) * 10) / 10)
+        generated.problem.time_limit = round(
+            min(generated.problem.time_limit, measured_time_limit), 2
+        )
+    if explicit_memory is None:
+        measured_memory_limit = max(64, math.ceil((max_memory * 2 + 32) / 16) * 16)
+        generated.problem.memory_limit = int(
+            min(generated.problem.memory_limit, measured_memory_limit)
+        )
+    final = {
+        "time_limit": generated.problem.time_limit,
+        "memory_limit": generated.problem.memory_limit,
+    }
+    return {
+        "applied": final != before,
+        "before": before,
+        "final": final,
+        "max_reference_time": round(max_time, 4),
+        "max_reference_memory": round(max_memory, 3),
+        "time_safety_multiplier": 6,
+        "minimum_time_limit": 0.5,
+        "explicit_time_preserved": explicit_time is not None,
+        "explicit_memory_preserved": explicit_memory is not None,
+    }
+
+
+async def _validate_complexity_probe(
+    generated: GeneratedProblem,
+    request: AIProblemTaskPayload,
+    stress_testcase_indexes: set[int],
+    stress_metadata: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    required = _requires_complexity_stress(request)
+    metadata: dict[str, Any] = {
+        **stress_metadata,
+        "required": required,
+        "passed": False if required else None,
+        "probe_results": [],
+    }
+    if not stress_testcase_indexes:
+        if required:
+            return ["复杂度压力 没有可执行的大规模隐藏测试点"], metadata
+        return [], metadata
+    if not generated.complexity_probe_solution.strip():
+        if required:
+            return ["复杂度压力 缺少可执行的低效复杂度探针解"], metadata
+        return [], metadata
+    artificial_delay = _artificial_probe_delay_pattern.search(generated.complexity_probe_solution)
+    if artificial_delay:
+        return [
+            f"复杂度压力 低效探针解包含人为延迟 {artificial_delay.group(0)!r}；"
+            "必须通过真实低效算法自然触发 TLE/MLE"
+        ], metadata
+
+    probe_cases = [
+        *(("sample", index, case) for index, case in enumerate(generated.problem.samples, 1)),
+        *(
+            ("ordinary", index + 1, case)
+            for index, case in enumerate(generated.problem.testcases)
+            if index not in stress_testcase_indexes
+        ),
+        *(
+            ("stress", index + 1, generated.problem.testcases[index])
+            for index in sorted(stress_testcase_indexes)
+        ),
+    ]
+    execution = await execute_reference_solution(
+        generated.problem,
+        generated.complexity_probe_solution,
+        inputs=[case.input for _, _, case in probe_cases],
+    )
+    if execution.setup_error:
+        return [f"复杂度压力 低效探针解无法启动：{execution.setup_error}"], metadata
+
+    errors: list[str] = []
+    rejected_stress = 0
+    for (kind, index, case), result in zip(probe_cases, execution.results, strict=True):
+        actual = normalize_output(result.stdout)
+        expected = normalize_output(case.output)
+        metadata["probe_results"].append(
+            {
+                "kind": kind,
+                "index": index,
+                "status": result.status,
+                "time": round(result.elapsed, 4),
+                "memory": round(result.peak_memory_mb, 3),
+            }
+        )
+        if kind != "stress":
+            if result.status != "OK" or actual != expected:
+                errors.append(
+                    f"复杂度压力 低效探针解未通过{'小样例' if kind == 'sample' else '普通点'} "
+                    f"{index}，不能证明它只是复杂度较低"
+                )
+            continue
+        if result.status in {"TLE", "MLE"}:
+            rejected_stress += 1
+        elif result.status == "OK" and actual == expected:
+            errors.append(f"复杂度压力 低效探针解通过了压力点 {index}，需要扩大数据或收紧限制")
+        else:
+            errors.append(
+                f"复杂度压力 低效探针解在压力点 {index} 得到 {result.status} 或错误答案；"
+                "探针必须答案正确并仅因 TLE/MLE 被淘汰"
+            )
+    metadata["rejected_stress_cases"] = rejected_stress
+    metadata["passed"] = not errors and rejected_stress == len(stress_testcase_indexes)
+    if not errors and rejected_stress != len(stress_testcase_indexes):
+        errors.append("复杂度压力 并非所有压力点都能淘汰低效探针解")
+        metadata["passed"] = False
+    return errors, metadata
+
+
+async def _validate_generated(
+    generated: GeneratedProblem,
+    request: AIProblemTaskPayload,
+    existing: dict[str, Any] | None,
+    *,
+    stress_metadata: dict[str, Any] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    calibration: dict[str, Any] = {"applied": False, "count": 0, "items": []}
+    stress_indexes = set((stress_metadata or {}).get("stress_testcase_indexes") or [])
+    errors = _static_validation_errors(
+        generated,
+        request,
+        existing,
+        stress_testcase_indexes=stress_indexes,
+    )
     if errors:
         return errors, calibration
 
@@ -1000,13 +1425,35 @@ async def _validate_generated(
             {
                 "kind": kind,
                 "index": index,
-                "input": case.input,
+                "input": (
+                    case.input
+                    if len(case.input) <= 2_000
+                    else case.input[:1_000]
+                    + f"\n…（压力输入共 {len(case.input)} 字符，预览已截断）"
+                ),
                 "original_output": case.output,
                 "calibrated_output": calibrated_output,
             }
         )
         case.output = calibrated_output
     calibration = {"applied": bool(items), "count": len(items), "items": items}
+    resource_tuning = _tune_resources_from_reference_runs(
+        generated,
+        request,
+        python_execution,
+        cpp_execution,
+        stress_indexes,
+    )
+    complexity_errors, complexity_validation = await _validate_complexity_probe(
+        generated,
+        request,
+        stress_indexes,
+        stress_metadata or {},
+    )
+    calibration["resource_tuning"] = resource_tuning
+    calibration["complexity_validation"] = complexity_validation
+    if complexity_errors:
+        return complexity_errors, calibration
     return [], calibration
 
 
@@ -1098,7 +1545,7 @@ async def _run_problem_task(
 
         await _update_task(
             task_id,
-            progress="正在交叉运行 Python/C++ 参考解法并校准答案",
+            progress="正在本地展开压力点并交叉运行 Python/C++ 参考解法",
             progress_percent=75,
             usage=usage,
         )
@@ -1107,16 +1554,36 @@ async def _run_problem_task(
         errors: list[str] = []
         calibration: dict[str, Any] = {"applied": False, "count": 0, "items": []}
         resource_limits: dict[str, Any] = {}
+        stress_metadata: dict[str, Any] = {}
         candidate_content = content
         for validation_attempt in range(3):
             try:
                 generated = GeneratedProblem.model_validate(_extract_json(candidate_content))
                 resource_limits = _apply_resource_limit_policy(generated, request)
-                errors, calibration = await _validate_generated(generated, request, existing)
+                errors = _static_validation_errors(generated, request, existing)
+                if not errors:
+                    generated, errors, stress_metadata = await _materialize_stress_cases(
+                        generated,
+                        request,
+                    )
+                if not errors:
+                    errors, calibration = await _validate_generated(
+                        generated,
+                        request,
+                        existing,
+                        stress_metadata=stress_metadata,
+                    )
+                    tuning = calibration.get("resource_tuning") or {}
+                    if tuning.get("applied"):
+                        resource_limits["final"] = dict(tuning["final"])
+                        resource_limits.setdefault("reasons", []).append(
+                            "根据压力点参考解法实测收紧限制，保留六倍时间余量"
+                        )
             except (ValidationError, ValueError, json.JSONDecodeError) as exc:
                 errors = [str(exc)]
                 calibration = {"applied": False, "count": 0, "items": []}
                 resource_limits = {}
+                stress_metadata = {}
                 generated = None
             if not errors:
                 break
@@ -1128,12 +1595,17 @@ async def _run_problem_task(
             repair_test_data = generated is not None and all(
                 error.startswith("测试数据 ") for error in errors
             )
+            repair_complexity = generated is not None and all(
+                error.startswith("复杂度压力 ") for error in errors
+            )
             if generated is not None and all(error.startswith("Python ") for error in errors):
                 repair_language = "Python"
             elif generated is not None and all(error.startswith("C++ ") for error in errors):
                 repair_language = "C++"
             repair_stage = (
-                f"定向修复测试数据 {repair_count}/2"
+                f"强化复杂度压力 {repair_count}/2"
+                if repair_complexity
+                else f"定向修复测试数据 {repair_count}/2"
                 if repair_test_data
                 else f"定向修复 {repair_language} {repair_count}/2"
                 if repair_language
@@ -1149,7 +1621,17 @@ async def _run_problem_task(
                     "stream_preview": "",
                 },
             )
-            if repair_test_data and generated is not None:
+            if repair_complexity and generated is not None:
+                repair_prompt = _complexity_repair_prompt(
+                    generated,
+                    request,
+                    errors=errors,
+                    base_testcase_count=int(
+                        stress_metadata.get("base_testcase_count", len(generated.problem.testcases))
+                    ),
+                )
+                system_message = "你是 OJ 复杂度审查员，只能返回压力生成器、低效探针和复杂度契约。"
+            elif repair_test_data and generated is not None:
                 repair_prompt = _test_data_repair_prompt(
                     generated,
                     request,
@@ -1185,7 +1667,24 @@ async def _run_problem_task(
             )
             _merge_stage_usage(usage, current_usage, config, repair_stage)
             await _record_model_usage(user_id, config_name, current_usage, config)
-            if repair_test_data and generated is not None:
+            if repair_complexity and generated is not None:
+                replacement = _extract_json(candidate_content)
+                required_fields = {
+                    "stress_test_generator",
+                    "complexity_probe_solution",
+                    "complexity_contract",
+                }
+                if not required_fields.issubset(replacement):
+                    raise RuntimeError("复杂度定向修复未返回全部必需字段")
+                merged = generated.model_dump(mode="json")
+                base_count = int(
+                    stress_metadata.get("base_testcase_count", len(generated.problem.testcases))
+                )
+                merged["problem"]["testcases"] = merged["problem"]["testcases"][:base_count]
+                for field in required_fields:
+                    merged[field] = replacement[field]
+                candidate_content = json.dumps(merged, ensure_ascii=False)
+            elif repair_test_data and generated is not None:
                 replacement = _extract_json(candidate_content)
                 samples = replacement.get("samples")
                 testcases = replacement.get("testcases")
@@ -1210,8 +1709,13 @@ async def _run_problem_task(
                 )
 
         assert generated is not None
+        original_problem_id = generated.problem.id
+        assigned_problem_id = str(existing["id"]) if existing else await _allocate_ai_problem_id()
+        generated.problem.id = assigned_problem_id
         generated.problem.author = config.model
         result = generated.model_dump(mode="json")
+        complexity_validation = calibration.pop("complexity_validation", {})
+        resource_tuning = calibration.pop("resource_tuning", {})
         result["validation"] = {
             "passed": True,
             "testcase_count": len(generated.problem.testcases),
@@ -1221,11 +1725,22 @@ async def _run_problem_task(
             "automatic_repair_count": repair_count,
             "output_calibration": calibration,
             "resource_limits": resource_limits,
+            "resource_tuning": resource_tuning,
+            "complexity_validation": complexity_validation,
+            "id_assignment": {
+                "source": "existing" if existing else "automatic",
+                "model_id": original_problem_id,
+                "final_id": assigned_problem_id,
+            },
         }
         await _update_task(
             task_id,
             status="completed",
-            progress="命题完成，已通过双语言交叉校验",
+            progress=(
+                "命题完成，已通过双语言与复杂度压力校验"
+                if complexity_validation.get("passed")
+                else "命题完成，已通过双语言交叉校验"
+            ),
             progress_percent=100,
             usage=usage,
             result=result,
@@ -1273,6 +1788,7 @@ def problem_to_dict(problem: Problem) -> dict[str, Any]:
 
 
 async def create_problem_task(user_id: int, request: AIProblemTaskPayload) -> AIProblemTask:
+    _explicit_resource_limits(request.requirement)
     await _ensure_model_store_loaded()
     configs = _model_configs.get(user_id, {})
     config_name = request.model_config_name or _active_model_configs.get(user_id)
@@ -1329,6 +1845,7 @@ async def cancel_all_ai_tasks(*, clear_configs: bool = False, purge_configs: boo
         _model_configs.clear()
         _active_model_configs.clear()
         _model_usage.clear()
+        _reserved_ai_ids.clear()
         _model_store_loaded = True
     if purge_configs:
         path = _store_path()
