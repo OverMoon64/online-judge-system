@@ -40,6 +40,8 @@ STATUS_LABELS = {
     "UNK": "UNK · 未知错误",
     "pending": "Pending · 评测中",
     "error": "Error · 任务异常",
+    "200": "允许访问",
+    "403": "拒绝访问",
 }
 STATUS_STYLES = {
     "AC": ("#067647", "#ecfdf3"),
@@ -51,6 +53,8 @@ STATUS_STYLES = {
     "UNK": ("#475467", "#f2f4f7"),
     "pending": ("#175cd3", "#eff8ff"),
     "error": ("#b42318", "#fef3f2"),
+    "200": ("#067647", "#ecfdf3"),
+    "403": ("#b42318", "#fef3f2"),
 }
 
 
@@ -1306,25 +1310,83 @@ def render_language_management() -> None:
 
 def render_audit_logs() -> None:
     st.markdown("#### 测试点日志访问审计")
-    filter1, filter2 = st.columns(2)
-    user_id = filter1.text_input("用户 ID（可选）", key="audit_user_id")
-    problem_id = filter2.text_input("题目 ID（可选）", key="audit_problem_id")
-    if st.button("查询审计日志", type="primary"):
-        if user_id and not user_id.isdigit():
-            st.error("用户 ID 必须为正整数。")
-            return
-        params: dict[str, Any] = {"page_size": 200}
-        if user_id:
-            params["user_id"] = user_id
-        if problem_id.strip():
-            params["problem_id"] = problem_id.strip()
-        with st.spinner("正在读取审计日志……"):
-            result = api_call("GET", "/api/logs/access/", params=params)
-        if result.get("code") == 200:
-            if result["data"]:
-                st.dataframe(result["data"], width="stretch", hide_index=True)
-            else:
-                st.info("当前筛选条件下没有审计记录。")
+    st.caption("记录测试点日志的成功与拒绝访问；不存在资源、未登录和参数错误不会写入审计。")
+    users_result = api_call("GET", "/api/users/?page=1&page_size=100", quiet=True)
+    problems_result = api_call("GET", "/api/problems/", quiet=True)
+    users = (users_result.get("data") or {}).get("users", [])
+    problems = problems_result.get("data") or []
+    user_names = {str(user["user_id"]): user["username"] for user in users}
+    problem_names = {problem["id"]: problem["title"] for problem in problems}
+    user_options = {"全部用户": ""} | {
+        f"{user['username']} (#{user['user_id']})": str(user["user_id"]) for user in users
+    }
+    problem_options = {"全部题目": ""} | {
+        f"{problem['id']} · {problem['title']}": problem["id"] for problem in problems
+    }
+    filter1, filter2, filter3, refresh = st.columns([2, 2, 1.5, 1])
+    selected_user = filter1.selectbox("访问用户", list(user_options), key="audit_user_filter")
+    selected_problem = filter2.selectbox(
+        "访问题目", list(problem_options), key="audit_problem_filter"
+    )
+    selected_status = filter3.selectbox(
+        "访问结果", ["全部", "允许", "拒绝"], key="audit_status_filter"
+    )
+    refresh.write("")
+    refresh.write("")
+    refresh.button("刷新", width="stretch")
+    params: dict[str, Any] = {"page_size": 200}
+    if user_options[selected_user]:
+        params["user_id"] = user_options[selected_user]
+    if problem_options[selected_problem]:
+        params["problem_id"] = problem_options[selected_problem]
+    with st.spinner("正在读取审计日志……"):
+        result = api_call("GET", "/api/logs/access/", params=params, quiet=True)
+    if result.get("code") != 200:
+        st.error(result.get("msg", "审计日志加载失败"))
+        return
+    logs = result["data"]
+    if selected_status != "全部":
+        target_status = "200" if selected_status == "允许" else "403"
+        logs = [entry for entry in logs if str(entry.get("status")) == target_status]
+    if not logs:
+        st.info("当前筛选条件下没有审计记录。")
+        return
+
+    allowed = sum(str(entry.get("status")) == "200" for entry in logs)
+    denied = len(logs) - allowed
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("访问记录", len(logs))
+    metric2.metric("允许", allowed)
+    metric3.metric("拒绝", denied)
+    metric4.metric("涉及用户", len({str(entry.get("user_id")) for entry in logs}))
+    rows = [
+        {
+            "时间": str(entry.get("time", "—")).replace("T", " ")[:19],
+            "用户": f"{user_names.get(str(entry.get('user_id')), '未知用户')} "
+            f"(#{entry.get('user_id', '—')})",
+            "题目": f"{problem_names.get(str(entry.get('problem_id')), '已删除/未知题目')} "
+            f"({entry.get('problem_id', '—')})",
+            "操作": "查看测试点日志",
+            "结果": "允许" if str(entry.get("status")) == "200" else "拒绝",
+        }
+        for entry in logs
+    ]
+    st.dataframe(rows, width="stretch", hide_index=True)
+    with st.expander("最近访问详情", expanded=True):
+        for entry in logs[:10]:
+            with st.container(border=True):
+                identity, target, outcome = st.columns([2, 3, 1])
+                user_id = str(entry.get("user_id", "—"))
+                problem_id = str(entry.get("problem_id", "—"))
+                identity.markdown(f"**{escape(user_names.get(user_id, '未知用户'))}**")
+                identity.caption(
+                    f"用户 #{user_id} · {str(entry.get('time', '')).replace('T', ' ')[:19]}"
+                )
+                target.markdown(f"**{escape(problem_names.get(problem_id, '已删除/未知题目'))}**")
+                target.caption(f"题目 {escape(problem_id)} · 查看测试点日志")
+                outcome.markdown(
+                    status_badge(str(entry.get("status", "403"))), unsafe_allow_html=True
+                )
 
 
 def render_system_reset() -> None:
