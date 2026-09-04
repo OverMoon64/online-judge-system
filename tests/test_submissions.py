@@ -30,6 +30,9 @@ async def test_python_judging_logs_rejudge_and_stats(client: httpx.AsyncClient) 
     await wait_for_submission(int(submission_id))
     result = (await client.get(f"/api/submissions/{submission_id}")).json()["data"]
     assert result["status"] == "success"
+    assert result["problem_id"] == "sum_2"
+    assert result["language"] == "python"
+    assert "map(int, input().split())" in result["code"]
     assert result["score"] == result["counts"] == 30
     assert result["compile_info"] is None
 

@@ -78,11 +78,16 @@ async def _user_data(session: SessionDep, user: User) -> dict[str, Any]:
     }
 
 
-def _submission_detail(submission: Submission) -> dict[str, Any]:
+def _submission_detail(submission: Submission, *, include_code: bool = False) -> dict[str, Any]:
     data: dict[str, Any] = {
         "submission_id": str(submission.id),
         "status": submission.status,
+        "problem_id": submission.problem_id,
+        "language": submission.language,
+        "created_at": submission.created_at.isoformat(),
     }
+    if include_code:
+        data["code"] = submission.code
     if submission.status != "pending":
         data.update(
             {
@@ -398,7 +403,7 @@ async def get_submission(
         raise ApiError(404, "submission not found")
     if current_user.role != "admin" and submission.user_id != current_user.id:
         raise ApiError(403, "permission denied")
-    return success(_submission_detail(submission))
+    return success(_submission_detail(submission, include_code=True))
 
 
 @router.put("/api/submissions/{submission_id}/rejudge")
@@ -491,7 +496,7 @@ async def list_access_logs(request: Request, session: SessionDep, _: AdminUser) 
 async def configure_ai_model(request: Request, current_user: CurrentUser) -> dict[str, Any]:
     payload = await parse_body(request, AIModelConfigPayload)
     try:
-        data = ai_service.set_model_config(current_user.id, payload)
+        data = await ai_service.set_model_config(current_user.id, payload)
     except ValueError as exc:
         raise ApiError(400, str(exc)) from exc
     return success(data, "model config updated")
@@ -499,10 +504,24 @@ async def configure_ai_model(request: Request, current_user: CurrentUser) -> dic
 
 @router.get("/api/ai/model-config")
 async def read_ai_model_config(current_user: CurrentUser) -> dict[str, Any]:
-    config = ai_service.get_model_config(current_user.id)
+    config = await ai_service.get_model_config(current_user.id)
     if config is None:
         raise ApiError(404, "model config not found")
     return success(config)
+
+
+@router.get("/api/ai/model-configs/")
+async def list_ai_model_configs(current_user: CurrentUser) -> dict[str, Any]:
+    return success(await ai_service.list_model_configs(current_user.id))
+
+
+@router.delete("/api/ai/model-configs/{config_name}")
+async def delete_ai_model_config(config_name: str, current_user: CurrentUser) -> dict[str, Any]:
+    try:
+        await ai_service.delete_model_config(current_user.id, config_name)
+    except ValueError as exc:
+        raise ApiError(404, str(exc)) from exc
+    return success(None, "model config deleted")
 
 
 @router.post("/api/ai/problem-tasks/")
@@ -558,7 +577,7 @@ async def reset_system(request: Request, session: SessionDep) -> dict[str, Any]:
         if user.role != "admin":
             raise ApiError(403, "permission denied")
     await cancel_all_submission_tasks()
-    await ai_service.cancel_all_ai_tasks(clear_configs=True)
+    await ai_service.cancel_all_ai_tasks(clear_configs=True, purge_configs=True)
     await session.rollback()
     await session.close()
     await reset_database()
