@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 import streamlit as st
+from code_editor import code_editor
 
 try:
     from frontend.api_client import (
@@ -48,7 +49,6 @@ def inject_theme() -> None:
         """
         <style>
         .block-container {padding-top: 2rem; padding-bottom: 3rem; max-width: 1180px;}
-        [data-testid="stSidebar"] {border-right: 1px solid #e4e7ec;}
         .oj-brand {font-size: 1.2rem; font-weight: 750; color: #193b68; margin-bottom: .2rem;}
         .oj-muted {color: #667085; font-size: .9rem;}
         .oj-user-card {padding: .8rem .9rem; border: 1px solid #d0d5dd; border-radius: .7rem;
@@ -60,6 +60,13 @@ def inject_theme() -> None:
                           background: #f5f8ff; border-radius: .25rem; color: #344054;}
         div[data-testid="stMetric"] {border: 1px solid #eaecf0; padding: .75rem 1rem;
                                      border-radius: .65rem; background: white;}
+        .st-key-top_navigation {padding: .8rem 1rem .35rem; border: 1px solid #e4e7ec;
+                                border-radius: .9rem; background: #ffffff;
+                                box-shadow: 0 4px 16px rgba(16, 24, 40, .05);}
+        .st-key-main_navigation div[role="radiogroup"] {gap: .35rem;}
+        .st-key-main_navigation button {border-radius: .6rem !important; font-weight: 650;}
+        .oj-top-user {text-align: right; font-size: .88rem; color: #475467; padding-top: .2rem;}
+        .oj-top-user strong {display: block; color: #101828; font-size: .95rem;}
         @media (max-width: 720px) {
           .block-container {padding: 1rem .8rem 2rem;}
           h1 {font-size: 1.65rem !important;}
@@ -388,9 +395,11 @@ def page_problems() -> None:
     login = require_login()
     if not login:
         return
-    st.title("题库与题目")
-    st.caption("浏览题目、查看个人通过状态，并在同一页面完成题目维护。")
-    browse_tab, create_tab, edit_tab = st.tabs(["浏览题库", "新增题目", "编辑题目"])
+    st.title("题库与评测")
+    st.caption("浏览题目、在线编写代码、查看判题记录，并在同一工作区维护题目。")
+    browse_tab, judge_tab, create_tab, edit_tab = st.tabs(
+        ["浏览题库", "在线做题与记录", "新增题目", "编辑题目"]
+    )
     result = api_call("GET", "/api/problems/", quiet=True)
     problems = result.get("data") or [] if result.get("code") == 200 else []
 
@@ -427,16 +436,11 @@ def page_problems() -> None:
             problem_id = data["id"]
 
             with st.container(border=True):
-                title_col, action_col = st.columns([4, 1])
-                title_col.subheader(f"{problem_id} · {data['title']}")
-                title_col.caption(
+                st.subheader(f"{problem_id} · {data['title']}")
+                st.caption(
                     f"难度：{data.get('difficulty') or '未标注'} · "
                     f"来源：{data.get('source') or '课程题库'} · {overview['state']}"
                 )
-                if action_col.button("前往提交", type="primary", width="stretch"):
-                    st.session_state.submit_problem_id = problem_id
-                    navigate_on_next_rerun("提交与评测")
-                    st.rerun()
 
                 limit1, limit2, limit3, limit4 = st.columns(4)
                 limit1.metric("时间限制", f"{data['time_limit']} s")
@@ -495,6 +499,9 @@ def page_problems() -> None:
                             set_flash("success", "题目已删除。")
                             st.rerun()
 
+    with judge_tab:
+        page_submissions(embedded=True)
+
     with create_tab:
         draft = st.session_state.get("ai_problem_draft")
         if draft:
@@ -552,14 +559,17 @@ def live_submission_panel() -> None:
 
 
 def render_submission_log(data: dict[str, Any]) -> None:
-    score_col, count_col, compile_col = st.columns(3)
+    details = data.get("details") or []
+    passed = sum(case.get("result") == "AC" for case in details)
+    score_col, count_col, passed_col = st.columns(3)
     score_col.metric("得分", data.get("score", 0))
     count_col.metric("总分", data.get("counts", 0))
-    compile_result = (data.get("compile_info") or {}).get("result", "无需编译")
-    compile_col.metric("编译", compile_result)
+    passed_col.metric("通过测试点", f"{passed} / {len(details)}")
+    compile_info = data.get("compile_info") or {}
+    if compile_info.get("result") == "failed":
+        st.error(f"编译失败：{compile_info.get('message') or '请检查语法和编译选项'}")
     if data.get("error_info"):
         st.error(data["error_info"])
-    details = data.get("details") or []
     if not details:
         st.info("暂无测试点明细。")
         return
@@ -577,13 +587,70 @@ def render_submission_log(data: dict[str, Any]) -> None:
             memory_col.write(f"{case.get('memory', 0):.3f} MB")
 
 
-def page_submissions() -> None:
+def _starter_code(language: str) -> str:
+    if language == "cpp":
+        return "#include <iostream>\nusing namespace std;\n\nint main() {\n    // 在这里编写代码\n    return 0;\n}\n"
+    if language == "python":
+        return "# 在这里编写代码\n"
+    return ""
+
+
+def _editor_language(language: str) -> str:
+    return {"cpp": "c_cpp", "python": "python"}.get(language, "text")
+
+
+def _display_language(language: str) -> str:
+    return {"cpp": "cpp", "python": "python"}.get(language, "text")
+
+
+def render_submission_detail(submission_id: str, login: dict[str, Any]) -> None:
+    detail_result = api_call("GET", f"/api/submissions/{submission_id}", quiet=True)
+    if detail_result.get("code") != 200:
+        st.error(detail_result.get("msg", "提交详情加载失败"))
+        return
+    data = detail_result["data"]
+    verdict = submission_verdict(data)
+    with st.container(border=True):
+        head, action = st.columns([5, 1])
+        with head:
+            st.markdown(status_badge(verdict), unsafe_allow_html=True)
+            st.caption(
+                f"提交 #{submission_id} · 题目 {data.get('problem_id', '—')} · "
+                f"{data.get('language', '—')} · {data.get('created_at', '')}"
+            )
+        if login["role"] == "admin" and action.button(
+            "重新评测", key=f"rejudge_{submission_id}", width="stretch"
+        ):
+            result = api_call("PUT", f"/api/submissions/{submission_id}/rejudge")
+            if result.get("code") == 200:
+                st.session_state.last_submission_id = submission_id
+                st.success("已开始重新评测。")
+
+        code_tab, cases_tab = st.tabs(["源代码", "测试点"])
+        with code_tab:
+            st.code(
+                data.get("code", ""),
+                language=_display_language(data.get("language", "")),
+                line_numbers=True,
+                wrap_lines=False,
+                height=420,
+            )
+        with cases_tab:
+            log_result = api_call("GET", f"/api/submissions/{submission_id}/log", quiet=True)
+            if log_result.get("code") == 200:
+                render_submission_log(log_result["data"])
+            else:
+                st.error(log_result.get("msg", "测试点日志加载失败"))
+
+
+def page_submissions(*, embedded: bool = False) -> None:
     login = require_login()
     if not login:
         return
-    st.title("提交与评测")
+    if not embedded:
+        st.title("提交与评测")
     st.caption("选择题目和语言提交代码；每位用户每分钟最多提交 3 次。")
-    submit_tab, records_tab, detail_tab = st.tabs(["提交代码", "我的记录", "详情与日志"])
+    submit_tab, records_tab = st.tabs(["提交代码", "我的提交"])
     problem_result = api_call("GET", "/api/problems/", quiet=True)
     language_result = api_call("GET", "/api/languages/", quiet=True)
     problems = problem_result.get("data") or []
@@ -610,15 +677,50 @@ def page_submissions() -> None:
                 limit1.metric("时间限制", f"{detail['time_limit']} s")
                 limit2.metric("内存限制", f"{detail['memory_limit']} MB")
                 limit3.metric("测试点", len(detail["testcases"]))
-            with st.form("submit_code"):
-                language = st.selectbox("语言 *", languages)
-                code = st.text_area(
-                    "源代码 *",
-                    height=340,
-                    placeholder="请粘贴可直接运行的完整程序，不要包含 Markdown 代码块。",
-                )
-                submitted = st.form_submit_button("提交评测", type="primary", width="stretch")
+            language = st.selectbox("语言 *", languages, key="judge_language")
+            st.caption("编辑器支持行号、Tab 缩进、括号补全、语法高亮、查找替换和 VS Code 快捷键。")
+            editor_response = code_editor(
+                _starter_code(language),
+                lang=_editor_language(language),
+                theme="light",
+                shortcuts="vscode",
+                height=30,
+                focus=True,
+                allow_reset=True,
+                buttons=[
+                    {
+                        "name": "提交评测",
+                        "feather": "Play",
+                        "primary": True,
+                        "hasText": True,
+                        "showWithIcon": True,
+                        "commands": ["submit"],
+                        "style": {"bottom": "0.44rem", "right": "0.4rem"},
+                    }
+                ],
+                options={
+                    "showLineNumbers": True,
+                    "tabSize": 4,
+                    "useSoftTabs": True,
+                    "enableBasicAutocompletion": True,
+                    "enableLiveAutocompletion": True,
+                    "enableSnippets": True,
+                    "behavioursEnabled": True,
+                    "highlightActiveLine": True,
+                    "showPrintMargin": False,
+                    "wrap": True,
+                },
+                key=f"judge_editor_{selected_problem_id}_{language}",
+            )
+            response_id = editor_response.get("id")
+            submitted = (
+                editor_response.get("type") == "submit"
+                and response_id
+                and response_id != st.session_state.get("last_editor_submit_id")
+            )
             if submitted:
+                st.session_state.last_editor_submit_id = response_id
+                code = editor_response.get("text", "")
                 if not code.strip():
                     st.error("源代码不能为空。")
                 else:
@@ -672,6 +774,8 @@ def page_submissions() -> None:
                 rows = [
                     {
                         "提交号": record["submission_id"],
+                        "题目": record.get("problem_id", "—"),
+                        "语言": record.get("language", "—"),
                         "结果": submission_verdict(record),
                         "得分": (
                             "—"
@@ -683,41 +787,19 @@ def page_submissions() -> None:
                     for record in submissions
                 ]
                 st.dataframe(rows, width="stretch", hide_index=True)
-
-    with detail_tab:
-        submission_id = st.text_input(
-            "提交 ID *", value=str(st.session_state.get("last_submission_id", ""))
-        )
-        col1, col2, col3 = st.columns(3)
-        valid_id = submission_id.isdigit()
-        if col1.button("查询详情", width="stretch", disabled=not valid_id):
-            with st.spinner("正在查询提交详情……"):
-                detail_result = api_call("GET", f"/api/submissions/{submission_id}")
-            if detail_result.get("code") == 200:
-                st.session_state.submission_detail = detail_result["data"]
-        if col2.button("查询测试点日志", width="stretch", disabled=not valid_id):
-            with st.spinner("正在读取测试点日志……"):
-                log_result = api_call("GET", f"/api/submissions/{submission_id}/log")
-            if log_result.get("code") == 200:
-                st.session_state.submission_log = log_result["data"]
-        if login["role"] == "admin" and col3.button(
-            "重新评测", width="stretch", disabled=not valid_id
-        ):
-            with st.spinner("正在重新创建评测任务……"):
-                result = api_call("PUT", f"/api/submissions/{submission_id}/rejudge")
-            if result.get("code") == 200:
-                st.session_state.last_submission_id = submission_id
-                st.success("已开始重新评测。")
-
-        detail_data = st.session_state.get("submission_detail")
-        if detail_data:
-            verdict = submission_verdict(detail_data)
-            st.markdown("#### 提交详情")
-            st.markdown(status_badge(verdict), unsafe_allow_html=True)
-            st.json(detail_data)
-        log_data = st.session_state.get("submission_log")
-        if log_data:
-            render_submission_log(log_data)
+                record_options = {
+                    (
+                        f"#{record['submission_id']} · {record.get('problem_id', '—')} · "
+                        f"{record.get('language', '—')} · {submission_verdict(record)}"
+                    ): record["submission_id"]
+                    for record in submissions
+                }
+                selected_record = st.selectbox(
+                    "查看提交详情",
+                    list(record_options),
+                    key="submission_record_selector",
+                )
+                render_submission_detail(record_options[selected_record], login)
 
 
 @st.fragment(run_every=1.0)
@@ -732,10 +814,13 @@ def live_ai_task_panel() -> None:
     data = response["data"]
     st.progress(data.get("progress_percent", 0), text=data.get("progress", ""))
     usage = data.get("usage") or {}
+    st.caption(f"模型配置：{usage.get('model_config_name', '—')} · 模型：{usage.get('model', '—')}")
     col1, col2, col3 = st.columns(3)
     col1.metric("输入 Token", usage.get("input_tokens", 0))
     col2.metric("输出 Token", usage.get("output_tokens", 0))
-    col3.metric("费用", f"{usage.get('cost', 0):.6f} {usage.get('currency', '')}")
+    currency = usage.get("currency", "CNY")
+    cost = float(usage.get("cost", 0) or 0)
+    col3.metric("本次花费", f"¥{cost:.2f}" if currency == "CNY" else f"{cost:.2f} {currency}")
     if usage.get("estimated"):
         st.caption("模型未返回完整 usage，当前 Token 与费用无法精确统计。")
     if data["status"] in {"pending", "running"}:
@@ -746,10 +831,31 @@ def live_ai_task_panel() -> None:
     elif data["status"] == "completed":
         st.success("AI 命题已完成并通过自动校验")
         result = data["result"]
-        st.json(result)
+        problem = result.get("problem", {})
+        with st.container(border=True):
+            st.subheader(f"{problem.get('id', '—')} · {problem.get('title', '未命名题目')}")
+            st.caption(
+                f"难度：{problem.get('difficulty') or '未标注'} · "
+                f"测试点：{len(problem.get('testcases') or [])} · "
+                f"时间：{problem.get('time_limit', '—')} s · "
+                f"内存：{problem.get('memory_limit', '—')} MB"
+            )
+            st.markdown(problem.get("description", ""))
+            with st.expander("查看参考解法与复杂度"):
+                st.code(result.get("reference_solution", ""), language="python", line_numbers=True)
+                st.markdown(result.get("solution_explanation", ""))
+            with st.expander("查看生成的测试点"):
+                for index, case in enumerate(problem.get("testcases") or [], start=1):
+                    left, right = st.columns(2)
+                    left.caption(f"测试点 {index} · 输入")
+                    left.code(case.get("input", ""), language=None)
+                    right.caption(f"测试点 {index} · 输出")
+                    right.code(case.get("output", ""), language=None)
         if st.button("载入到题目新增表单", key=f"load_{task_id}"):
             st.session_state.ai_problem_draft = result["problem"]
-            st.success("已载入。请切换到“题目 → 新增题目”审阅并保存。")
+            navigate_on_next_rerun("题库与评测")
+            set_flash("success", "草稿已载入。请在“题库与评测 → 新增题目”中人工审阅。")
+            st.rerun()
     elif data["status"] == "cancelled":
         st.warning("任务已中断，后台不会继续调用模型。")
     else:
@@ -760,20 +866,108 @@ def page_ai() -> None:
     if not require_login():
         return
     st.header("AI 智能命题")
-    st.caption("密钥仅保存在后端进程内存中，不写入数据库、日志或页面响应。")
-    config_tab, task_tab = st.tabs(["模型配置", "智能命题"])
+    st.caption("先选择已配置模型进行命题；API Key 加密保存在本机，不进入数据库、日志或响应。")
+    configs_result = api_call("GET", "/api/ai/model-configs/", quiet=True)
+    configured_models = (
+        configs_result.get("data", {}).get("models", [])
+        if configs_result.get("code") == 200
+        else []
+    )
+    task_tab, config_tab = st.tabs(["智能命题", "模型配置"])
+
+    with task_tab:
+        if not configured_models:
+            st.warning("尚未配置模型，请先切换到“模型配置”添加 OpenAI-compatible 模型。")
+        problem_result = api_call("GET", "/api/problems/", quiet=True)
+        existing_ids = [item["id"] for item in problem_result.get("data") or []]
+        with st.form("ai_task"):
+            model_names = [item["name"] for item in configured_models]
+            selected_model = st.selectbox(
+                "命题模型 *",
+                model_names or ["暂无可用模型"],
+                disabled=not model_names,
+                format_func=lambda name: next(
+                    (
+                        f"{item['name']} · {item['model']}"
+                        for item in configured_models
+                        if item["name"] == name
+                    ),
+                    name,
+                ),
+            )
+            requirement = st.text_area(
+                "命题需求 *",
+                height=150,
+                placeholder="例如：设计一道考查滑动窗口的中等难度题，避免套用经典题面……",
+            )
+            knowledge_text = st.text_input("知识点（逗号分隔）")
+            left, right = st.columns(2)
+            difficulty = left.selectbox("预期难度", ["入门", "简单", "中等", "困难"])
+            testcase_count = right.slider("测试点数量", 2, 10, 6)
+            problem_id = st.selectbox("参考/修改已有题目（可选）", [""] + existing_ids)
+            submitted = st.form_submit_button(
+                "开始智能命题", type="primary", width="stretch", disabled=not model_names
+            )
+        if submitted:
+            if len(requirement.strip()) < 10:
+                st.error("命题需求至少需要 10 个字符。")
+            else:
+                result = api_call(
+                    "POST",
+                    "/api/ai/problem-tasks/",
+                    json={
+                        "requirement": requirement,
+                        "problem_id": problem_id or None,
+                        "model_config_name": selected_model,
+                        "knowledge_points": [
+                            item.strip() for item in knowledge_text.split(",") if item.strip()
+                        ],
+                        "difficulty": difficulty,
+                        "testcase_count": testcase_count,
+                    },
+                )
+                if result.get("code") == 200:
+                    st.session_state.ai_task_id = result["data"]["task_id"]
+                    st.success(f"任务已创建：{result['data']['task_id']}")
+        live_ai_task_panel()
+
     with config_tab:
-        current = api_call("GET", "/api/ai/model-config", quiet=True)
-        if current.get("code") == 200:
-            st.success("已配置模型（API Key 已隐藏）")
-            st.json(current["data"])
+        if configured_models:
+            st.markdown("#### 已配置模型")
+            for item in configured_models:
+                usage = item.get("usage") or {}
+                with st.container(border=True):
+                    title, remove = st.columns([5, 1])
+                    title.markdown(
+                        f"**{escape(item['name'])}** · `{escape(item['model'])}`"
+                        + (" · 当前默认" if item.get("active") else "")
+                    )
+                    if remove.button("删除", key=f"delete_model_{item['name']}"):
+                        deleted = api_call("DELETE", f"/api/ai/model-configs/{item['name']}")
+                        if deleted.get("code") == 200:
+                            set_flash("success", f"模型配置 {item['name']} 已删除。")
+                            st.rerun()
+                    st.caption(item["provider_url"])
+                    input_col, output_col, cost_col = st.columns(3)
+                    input_col.metric("累计输入 Token", usage.get("input_tokens", 0))
+                    output_col.metric("累计输出 Token", usage.get("output_tokens", 0))
+                    amount = float(usage.get("cost", 0) or 0)
+                    cost_col.metric(
+                        "累计花费",
+                        f"¥{amount:.2f}"
+                        if item.get("currency") == "CNY"
+                        else f"{amount:.2f} {item.get('currency', '')}",
+                    )
+
+        st.markdown("#### 添加或更新模型")
         with st.form("ai_config"):
+            config_name = st.text_input("配置名称 *", placeholder="例如：百炼主模型")
             provider_url = st.text_input(
-                "提供商 Base URL",
+                "提供商 Base URL *",
                 placeholder="https://你的业务空间地址/compatible-mode/v1",
             )
-            model = st.text_input("模型名称", placeholder="例如 qwen3.7-plus")
-            api_key = st.text_input("API Key", type="password")
+            model = st.text_input("模型名称 *", placeholder="例如 qwen3.7-plus")
+            api_key = st.text_input("API Key *", type="password")
             left, right = st.columns(2)
             input_price = left.number_input("输入单价", 0.0, value=0.0, format="%.6f")
             output_price = right.number_input("输出单价", 0.0, value=0.0, format="%.6f")
@@ -785,6 +979,7 @@ def page_ai() -> None:
                 "PUT",
                 "/api/ai/model-config",
                 json={
+                    "name": config_name,
                     "provider_url": provider_url,
                     "model": model,
                     "api_key": api_key,
@@ -795,40 +990,8 @@ def page_ai() -> None:
                 },
             )
             if result.get("code") == 200:
-                st.success("模型配置已应用")
-
-    with task_tab:
-        problem_result = api_call("GET", "/api/problems/", quiet=True)
-        existing_ids = [item["id"] for item in problem_result.get("data") or []]
-        with st.form("ai_task"):
-            requirement = st.text_area(
-                "命题需求",
-                height=150,
-                placeholder="例如：设计一道考查滑动窗口的中等难度题，避免套用经典题面……",
-            )
-            knowledge_text = st.text_input("知识点（逗号分隔）")
-            difficulty = st.selectbox("预期难度", ["入门", "简单", "中等", "困难"])
-            testcase_count = st.slider("测试点数量", 3, 30, 12)
-            problem_id = st.selectbox("参考/修改已有题目（可选）", [""] + existing_ids)
-            submitted = st.form_submit_button("开始命题", type="primary")
-        if submitted:
-            result = api_call(
-                "POST",
-                "/api/ai/problem-tasks/",
-                json={
-                    "requirement": requirement,
-                    "problem_id": problem_id or None,
-                    "knowledge_points": [
-                        item.strip() for item in knowledge_text.split(",") if item.strip()
-                    ],
-                    "difficulty": difficulty,
-                    "testcase_count": testcase_count,
-                },
-            )
-            if result.get("code") == 200:
-                st.session_state.ai_task_id = result["data"]["task_id"]
-                st.success(f"任务已创建：{result['data']['task_id']}")
-        live_ai_task_panel()
+                set_flash("success", f"模型配置 {config_name} 已加密保存。")
+                st.rerun()
 
 
 def render_user_management(login: dict[str, Any]) -> None:
@@ -985,8 +1148,7 @@ def main() -> None:
     if login:
         pages = {
             "账户概览": page_account,
-            "题库与题目": page_problems,
-            "提交与评测": page_submissions,
+            "题库与评测": page_problems,
             "AI 智能命题": page_ai,
         }
         if login["role"] == "admin":
@@ -1001,27 +1163,46 @@ def main() -> None:
     if current_navigation not in pages:
         st.session_state.main_navigation = next(iter(pages))
 
-    with st.sidebar:
-        st.markdown('<div class="oj-brand">⚖️ 在线评测系统</div>', unsafe_allow_html=True)
-        st.markdown('<div class="oj-muted">课程大作业 2 · Async OJ</div>', unsafe_allow_html=True)
-        st.divider()
+    with st.container(key="top_navigation"):
+        brand_col, user_col, logout_col = st.columns([5, 2, 1], vertical_alignment="center")
+        brand_col.markdown('<div class="oj-brand">⚖️ 在线评测系统</div>', unsafe_allow_html=True)
+        brand_col.markdown(
+            '<div class="oj-muted">课程大作业 2 · Async OJ · 所有操作均通过 REST API</div>',
+            unsafe_allow_html=True,
+        )
         if login:
-            st.markdown(
+            user_col.markdown(
                 (
-                    '<div class="oj-user-card">'
-                    f'<div class="oj-user-name">{escape(login["username"])}</div>'
-                    f'<div class="oj-muted">{role_label(login["role"])} · ID {login["user_id"]}</div>'
+                    '<div class="oj-top-user">'
+                    f"<strong>{escape(login['username'])}</strong>"
+                    f"{role_label(login['role'])} · ID {login['user_id']}"
                     "</div>"
                 ),
                 unsafe_allow_html=True,
             )
-            if st.button("退出登录", width="stretch"):
+            if logout_col.button("退出", width="stretch", type="secondary"):
                 logout_user()
-            st.divider()
-        navigation = st.radio("功能导航", list(pages), key="main_navigation")
-        st.divider()
-        st.caption(f"API：{DEFAULT_API_BASE_URL}")
-        st.caption("所有页面仅通过 REST API 访问后端。")
+        else:
+            user_col.caption(f"API：{DEFAULT_API_BASE_URL}")
+
+        if len(pages) > 1:
+            navigation = st.segmented_control(
+                "功能导航",
+                list(pages),
+                key="main_navigation",
+                selection_mode="single",
+                required=True,
+                width="stretch",
+                label_visibility="collapsed",
+                format_func=lambda page: {
+                    "账户概览": "👤 账户概览",
+                    "题库与评测": "💻 题库与评测",
+                    "AI 智能命题": "✨ AI 智能命题",
+                    "后台管理": "⚙️ 后台管理",
+                }.get(page, page),
+            )
+        else:
+            navigation = next(iter(pages))
 
     show_flash()
     pages[navigation]()

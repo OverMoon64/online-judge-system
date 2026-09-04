@@ -11,4 +11,5 @@ def test_frontend_initial_account_page_renders() -> None:
     assert not app.exception
     assert app.title[0].value == "账户中心"
     assert {tab.label for tab in app.tabs} == {"登录账户", "注册账户"}
-    assert app.radio[0].options == ["登录 / 注册"]
+    assert any("在线评测系统" in item.value for item in app.markdown)
+    assert not app.radio
