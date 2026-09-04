@@ -52,7 +52,38 @@ async def test_provider_failure_retries_twice(monkeypatch):
     result = await ai_service._provider_request_with_retry(config, [])
 
     assert result[0] == "ok"
+    assert result[1]["request_count"] == 3
+    assert result[1]["estimated"] is True
     assert attempts == 3
+
+
+async def test_known_model_pricing_and_manual_fallback(client: httpx.AsyncClient) -> None:
+    assert (
+        await client.get(
+            "/api/ai/model-pricing",
+            params={
+                "provider_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "model": "qwen3.7-plus",
+            },
+        )
+    ).status_code == 401
+    await login(client)
+    known = await client.get(
+        "/api/ai/model-pricing",
+        params={
+            "provider_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "model": "qwen3.7-plus",
+        },
+    )
+    assert known.status_code == 200
+    assert known.json()["data"]["input_price"] == 1.6
+    assert known.json()["data"]["output_price"] == 6.4
+    assert known.json()["data"]["currency"] == "CNY"
+    unknown = await client.get(
+        "/api/ai/model-pricing",
+        params={"provider_url": "https://example.test/v1", "model": "custom-model"},
+    )
+    assert unknown.status_code == 404
 
 
 async def test_stream_preview_callback_updates_running_task(monkeypatch):
@@ -184,6 +215,12 @@ async def test_ai_config_generation_usage_and_secret_masking(
     assert task["usage"]["output_tokens"] == 100
     assert task["usage"]["cost"] == 0.0012
     assert task["usage"]["model_config_name"] == "primary"
+    assert task["usage"]["request_count"] == 2
+    assert [item["stage"] for item in task["usage"]["calls"]] == [
+        "需求分析",
+        "题面、解法与测试点",
+    ]
+    assert task["result"]["problem"]["author"] == "course-demo-model"
     assert used_models == {"course-demo-model"}
     listed = await client.get("/api/ai/model-configs/")
     primary = next(item for item in listed.json()["data"]["models"] if item["name"] == "primary")
@@ -244,6 +281,11 @@ async def test_ai_invalid_draft_is_repaired_and_provider_failure_is_reported(
             return "边界条件分析", {"input_tokens": 1, "output_tokens": 1}
         if calls == 2:
             return "this is not JSON", {"input_tokens": 2, "output_tokens": 2}
+        if calls == 3:
+            return json.dumps({"problem": generated_payload()["problem"]}, ensure_ascii=False), {
+                "input_tokens": 3,
+                "output_tokens": 3,
+            }
         return json.dumps(generated_payload(), ensure_ascii=False), {
             "input_tokens": 3,
             "output_tokens": 3,
@@ -260,7 +302,8 @@ async def test_ai_invalid_draft_is_repaired_and_provider_failure_is_reported(
     repaired = await _wait_task(client, response.json()["data"]["task_id"])
     assert repaired["status"] == "completed"
     assert repaired["result"]["validation"]["automatic_repair_used"] is True
-    assert repaired["usage"]["total_tokens"] == 12
+    assert repaired["result"]["validation"]["automatic_repair_count"] == 2
+    assert repaired["usage"]["total_tokens"] == 18
 
     async def failed_provider(*_args, **_kwargs):
         raise RuntimeError("provider unavailable")

@@ -48,6 +48,10 @@ def _public_config(
         "output_price": config.output_price,
         "price_unit": config.price_unit,
         "currency": config.currency,
+        "disable_thinking": config.disable_thinking,
+        "price_source": config.price_source,
+        "price_source_url": config.price_source_url,
+        "pricing_note": config.pricing_note,
         "active": active,
         "usage": usage
         or {
@@ -215,18 +219,69 @@ def _completion_endpoint(base_url: str) -> str:
     return base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
 
 
+def suggest_model_pricing(provider_url: str, model: str) -> dict[str, Any]:
+    host = (urlparse(provider_url).hostname or "").lower()
+    normalized_model = model.strip().lower()
+    if "aliyuncs.com" not in host:
+        raise ValueError("该 OpenAI-compatible 服务没有可识别的公开计价表，请手动填写")
+
+    international = "dashscope-intl" in host
+    source_url = "https://help.aliyun.com/zh/model-studio/model-pricing"
+    common = {
+        "price_unit": 1_000_000,
+        "currency": "CNY",
+        "price_source": "阿里云百炼官方模型价格",
+        "price_source_url": source_url,
+        "as_of": "2026-09-04",
+    }
+    if normalized_model.startswith("qwen3.7-plus"):
+        if international:
+            input_price, output_price = 2.998, 11.991
+            region = "国际站"
+        elif normalized_model == "qwen3.7-plus":
+            input_price, output_price = 1.6, 6.4
+            region = "中国站限时折扣"
+        else:
+            input_price, output_price = 2.0, 8.0
+            region = "中国站快照版"
+        tier = "单次请求输入不超过 256K Token"
+    elif normalized_model.startswith("qwen3.7-flash"):
+        if international:
+            input_price, output_price = 0.225, 0.974
+            region = "国际站"
+        else:
+            input_price, output_price = 0.2, 0.8
+            region = "中国站"
+        tier = "单次请求输入不超过 32K Token"
+    else:
+        raise ValueError("该模型暂无内置官方价格预设，请按服务商控制台手动填写")
+    return {
+        **common,
+        "input_price": input_price,
+        "output_price": output_price,
+        "pricing_note": f"{region}，{tier}；阶梯、缓存和后续调价请以官方控制台为准。",
+    }
+
+
 async def _provider_request(
     config: AIModelConfigPayload,
     messages: list[dict[str, str]],
     *,
     on_delta: StreamCallback | None = None,
-) -> tuple[str, dict[str, int]]:
+) -> tuple[str, dict[str, Any]]:
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     payload = {
         "model": config.model,
         "messages": messages,
         "temperature": 0.35,
     }
+    provider_host = (urlparse(config.provider_url).hostname or "").lower()
+    if (
+        config.disable_thinking
+        and config.model.lower().startswith("qwen")
+        and "aliyuncs.com" in provider_host
+    ):
+        payload["enable_thinking"] = False
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
             endpoint = _completion_endpoint(config.provider_url)
@@ -269,10 +324,16 @@ async def _provider_request_with_retry(
     *,
     retry_count: int = 2,
     on_delta: StreamCallback | None = None,
-) -> tuple[str, dict[str, int]]:
+) -> tuple[str, dict[str, Any]]:
     for attempt in range(retry_count + 1):
         try:
-            return await _provider_request(config, messages, on_delta=on_delta)
+            content, usage = await _provider_request(config, messages, on_delta=on_delta)
+            usage = dict(usage)
+            usage["request_count"] = attempt + 1
+            if attempt:
+                usage["estimated"] = True
+                usage["unreported_attempts"] = attempt
+            return content, usage
         except RuntimeError:
             if attempt >= retry_count:
                 raise
@@ -280,15 +341,29 @@ async def _provider_request_with_retry(
     raise RuntimeError("模型服务请求失败")
 
 
-def _token_usage(value: dict[str, Any] | None) -> dict[str, int]:
+def _token_usage(value: dict[str, Any] | None) -> dict[str, Any]:
     usage = value or {}
+    input_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+    output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+    output_details = (
+        usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
+    )
     return {
-        "input_tokens": int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0),
-        "output_tokens": int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "provider_total_tokens": int(
+            usage.get("total_tokens", usage.get("total_token_count", input_tokens + output_tokens))
+            or 0
+        ),
+        "cached_input_tokens": int(input_details.get("cached_tokens", 0) or 0),
+        "reasoning_tokens": int(output_details.get("reasoning_tokens", 0) or 0),
+        "request_count": 1,
+        "estimated": not bool(value),
     }
 
 
-def _parse_non_stream_response(body: dict[str, Any]) -> tuple[str, dict[str, int]]:
+def _parse_non_stream_response(body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     content = body["choices"][0]["message"]["content"]
     if not isinstance(content, str) or not content:
         raise ValueError("model response content is empty")
@@ -310,10 +385,10 @@ def _delta_text(value: Any) -> str:
 async def _consume_stream_response(
     response: httpx.Response,
     on_delta: StreamCallback | None,
-) -> tuple[str, dict[str, int]]:
+) -> tuple[str, dict[str, Any]]:
     content_parts: list[str] = []
     raw_lines: list[str] = []
-    usage = {"input_tokens": 0, "output_tokens": 0}
+    usage = _token_usage(None)
     received_event = False
     async for line in response.aiter_lines():
         stripped = line.strip()
@@ -350,6 +425,10 @@ def _empty_usage(config: AIModelConfigPayload) -> dict[str, Any]:
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
+        "provider_total_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "request_count": 0,
         "cost": 0.0,
         "currency": config.currency,
         "price_unit": config.price_unit,
@@ -358,23 +437,60 @@ def _empty_usage(config: AIModelConfigPayload) -> dict[str, Any]:
 
 
 def _merge_usage(
-    total: dict[str, Any], current: dict[str, int], config: AIModelConfigPayload
+    total: dict[str, Any], current: dict[str, Any], config: AIModelConfigPayload
 ) -> None:
-    total["input_tokens"] += current.get("input_tokens", 0)
-    total["output_tokens"] += current.get("output_tokens", 0)
+    for field in (
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "reasoning_tokens",
+        "request_count",
+    ):
+        total[field] = int(total.get(field, 0)) + int(current.get(field, 0) or 0)
+    current_provider_total = int(
+        current.get(
+            "provider_total_tokens",
+            int(current.get("input_tokens", 0)) + int(current.get("output_tokens", 0)),
+        )
+        or 0
+    )
+    total["provider_total_tokens"] = int(total.get("provider_total_tokens", 0)) + int(
+        current_provider_total
+    )
     total["total_tokens"] = total["input_tokens"] + total["output_tokens"]
     total["cost"] = round(
         total["input_tokens"] / config.price_unit * config.input_price
         + total["output_tokens"] / config.price_unit * config.output_price,
         8,
     )
-    total["estimated"] = total["total_tokens"] == 0
+    total["estimated"] = (
+        bool(total.get("estimated")) or bool(current.get("estimated")) or total["total_tokens"] == 0
+    )
+    if current.get("unreported_attempts"):
+        total["unreported_attempts"] = int(total.get("unreported_attempts", 0)) + int(
+            current["unreported_attempts"]
+        )
+
+
+def _merge_stage_usage(
+    total: dict[str, Any], current: dict[str, Any], config: AIModelConfigPayload, stage: str
+) -> None:
+    _merge_usage(total, current, config)
+    total.setdefault("calls", []).append(
+        {
+            "stage": stage,
+            "input_tokens": int(current.get("input_tokens", 0) or 0),
+            "output_tokens": int(current.get("output_tokens", 0) or 0),
+            "reasoning_tokens": int(current.get("reasoning_tokens", 0) or 0),
+            "request_count": int(current.get("request_count", 1) or 1),
+        }
+    )
 
 
 async def _record_model_usage(
     user_id: int,
     config_name: str,
-    current: dict[str, int],
+    current: dict[str, Any],
     config: AIModelConfigPayload,
 ) -> None:
     await _ensure_model_store_loaded()
@@ -441,13 +557,44 @@ def _stream_preview_callback(task_id: str, stage: str) -> StreamCallback:
 
 def _extract_json(content: str) -> dict[str, Any]:
     cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", content.strip())
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start < 0 or end <= start:
+    start = cleaned.find("{")
+    if start < 0:
         raise ValueError("模型响应中没有 JSON 对象")
-    value = json.loads(cleaned[start : end + 1])
+    value, _ = json.JSONDecoder(strict=False).raw_decode(cleaned[start:])
     if not isinstance(value, dict):
         raise ValueError("模型响应根节点必须是对象")
-    return value
+    return _normalize_generated_payload(value)
+
+
+def _normalize_generated_payload(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(value)
+    problem = normalized.get("problem")
+    solution_fields = {
+        "reference_solution": ("python_solution", "reference_solution_python"),
+        "reference_solution_cpp": ("cpp_solution", "cxx_solution"),
+        "solution_explanation": ("explanation",),
+    }
+    if not isinstance(problem, dict) and {"id", "title", "description"}.issubset(normalized):
+        problem = {
+            key: field_value
+            for key, field_value in normalized.items()
+            if key not in solution_fields
+            and not any(key in aliases for aliases in solution_fields.values())
+        }
+        normalized = {"problem": problem}
+    if isinstance(problem, dict):
+        problem = dict(problem)
+        normalized["problem"] = problem
+        for canonical, aliases in solution_fields.items():
+            if canonical not in normalized:
+                for candidate in (canonical, *aliases):
+                    if candidate in problem:
+                        normalized[canonical] = problem.pop(candidate)
+                        break
+                    if candidate in value:
+                        normalized[canonical] = value[candidate]
+                        break
+    return normalized
 
 
 def _generation_prompt(
@@ -480,11 +627,12 @@ def _generation_prompt(
     "time_limit": 1.0, "memory_limit": 128, "author": "AI Assistant",
     "difficulty": "{request.difficulty}"
   }},
-  "reference_solution": "完整 Python 3 程序",
-  "reference_solution_cpp": "完整 C++14 程序",
+    "reference_solution": "完整 Python 3 程序，换行必须写成 JSON 转义字符 \\n",
+    "reference_solution_cpp": "完整 C++14 程序，换行必须写成 JSON 转义字符 \\n",
   "solution_explanation": "正确性和复杂度说明"
 }}
 两个参考程序必须使用相同算法并对所有 output 给出一致结果；Python 只能使用标准库，C++ 使用 C++14。
+所有字符串中的换行、制表符和控制字符都必须按 JSON 规则转义，禁止输出字面控制字符。
 """.strip()
 
 
@@ -523,7 +671,7 @@ async def _run_problem_task(
     config_name: str,
 ) -> None:
     usage = _empty_usage(config)
-    usage.update({"model_config_name": config_name, "model": config.model})
+    usage.update({"model_config_name": config_name, "model": config.model, "calls": []})
     try:
         existing: dict[str, Any] | None = None
         if request.problem_id:
@@ -555,7 +703,7 @@ async def _run_problem_task(
             ],
             on_delta=_stream_preview_callback(task_id, "需求分析"),
         )
-        _merge_usage(usage, current_usage, config)
+        _merge_stage_usage(usage, current_usage, config, "需求分析")
         await _record_model_usage(user_id, config_name, current_usage, config)
 
         await _update_task(
@@ -573,7 +721,7 @@ async def _run_problem_task(
             ],
             on_delta=_stream_preview_callback(task_id, "题面、解法与测试点"),
         )
-        _merge_usage(usage, current_usage, config)
+        _merge_stage_usage(usage, current_usage, config, "题面、解法与测试点")
         await _record_model_usage(user_id, config_name, current_usage, config)
 
         await _update_task(
@@ -582,50 +730,62 @@ async def _run_problem_task(
             progress_percent=75,
             usage=usage,
         )
-        validation_message = ""
-        try:
-            generated = GeneratedProblem.model_validate(_extract_json(content))
-            errors = await _validate_generated(generated, request, existing)
-        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
-            errors = [str(exc)]
-            generated = None
-
-        if errors:
+        generated: GeneratedProblem | None = None
+        repair_count = 0
+        errors: list[str] = []
+        candidate_content = content
+        for validation_attempt in range(3):
+            try:
+                generated = GeneratedProblem.model_validate(_extract_json(candidate_content))
+                errors = await _validate_generated(generated, request, existing)
+            except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                errors = [str(exc)]
+                generated = None
+            if not errors:
+                break
+            if validation_attempt >= 2:
+                raise RuntimeError("两次自动修正后仍未通过校验：" + "; ".join(errors[:20]))
+            repair_count += 1
             validation_message = "; ".join(errors[:20])
             await _update_task(
                 task_id,
-                progress="初稿未通过校验，正在进行一次自动修正",
-                progress_percent=85,
+                progress=f"初稿未通过校验，正在进行第 {repair_count}/2 次自动修正",
+                progress_percent=80 + repair_count * 7,
                 usage=usage,
-                result={"stream_stage": "自动修正", "stream_preview": ""},
+                result={
+                    "stream_stage": f"自动修正 {repair_count}/2",
+                    "stream_preview": "",
+                },
             )
             repair_prompt = (
-                "请修正下面的 OJ 题目 JSON。只返回完整、严格 JSON，不要解释。\n"
-                f"校验错误：{validation_message}\n原始内容：{content}"
+                _generation_prompt(request, blueprint, existing)
+                + "\n\n上一稿未通过校验，请根据错误从头生成完整 JSON，不要省略任何根字段。"
+                + f"\n校验错误：{validation_message}"
             )
-            repaired, current_usage = await _provider_request_with_retry(
+            candidate_content, current_usage = await _provider_request_with_retry(
                 config,
                 [
-                    {"role": "system", "content": "你是 OJ 题目质量审查员。"},
+                    {
+                        "role": "system",
+                        "content": "你是 OJ 题目质量审查员，只能返回完整、严格的 JSON 对象。",
+                    },
                     {"role": "user", "content": repair_prompt},
                 ],
-                on_delta=_stream_preview_callback(task_id, "自动修正"),
+                on_delta=_stream_preview_callback(task_id, f"自动修正 {repair_count}/2"),
             )
-            _merge_usage(usage, current_usage, config)
+            _merge_stage_usage(usage, current_usage, config, f"自动修正 {repair_count}/2")
             await _record_model_usage(user_id, config_name, current_usage, config)
-            generated = GeneratedProblem.model_validate(_extract_json(repaired))
-            errors = await _validate_generated(generated, request, existing)
-            if errors:
-                raise RuntimeError("自动修正后仍未通过校验：" + "; ".join(errors[:20]))
 
         assert generated is not None
+        generated.problem.author = config.model
         result = generated.model_dump(mode="json")
         result["validation"] = {
             "passed": True,
             "testcase_count": len(generated.problem.testcases),
             "reference_solution_executed": True,
             "reference_languages": ["python", "cpp"],
-            "automatic_repair_used": bool(validation_message),
+            "automatic_repair_used": repair_count > 0,
+            "automatic_repair_count": repair_count,
         }
         await _update_task(
             task_id,

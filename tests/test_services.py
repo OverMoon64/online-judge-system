@@ -179,7 +179,9 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     )
     content, usage = await ai_service._provider_request(_config(), [])
     assert content == "answer"
-    assert usage == {"input_tokens": 3, "output_tokens": 4}
+    assert usage["input_tokens"] == 3
+    assert usage["output_tokens"] == 4
+    assert usage["provider_total_tokens"] == 7
     assert _FakeClient.last_json["stream"] is True
 
     _FakeClient.response = _FakeResponse(
@@ -198,7 +200,8 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     content, usage = await ai_service._provider_request(_config(), [], on_delta=capture_delta)
     assert content == "answer"
     assert deltas == ["ans", "wer"]
-    assert usage == {"input_tokens": 5, "output_tokens": 6}
+    assert usage["input_tokens"] == 5
+    assert usage["output_tokens"] == 6
 
     _FakeClient.response = _FakeResponse({}, status_code=400)
     _FakeClient.fallback_response = _FakeResponse(
@@ -209,7 +212,8 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     )
     content, usage = await ai_service._provider_request(_config(), [])
     assert content == "fallback answer"
-    assert usage == {"input_tokens": 7, "output_tokens": 8}
+    assert usage["input_tokens"] == 7
+    assert usage["output_tokens"] == 8
     _FakeClient.fallback_response = None
 
     _FakeClient.response = _FakeResponse({}, status_code=401)
@@ -229,19 +233,53 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     full = "https://x/v1/chat/completions"
     assert ai_service._completion_endpoint(full) == full
     assert ai_service._extract_json('```json\n{"x": 1}\n```') == {"x": 1}
+    assert ai_service._extract_json('{"text":"line one\nline two"}') == {
+        "text": "line one\nline two"
+    }
     with pytest.raises(ValueError, match="没有 JSON"):
         ai_service._extract_json("plain text")
     with pytest.raises(ValueError, match="没有 JSON"):
         ai_service._extract_json("[1, 2]")
-    monkeypatch.setattr(ai_service.json, "loads", lambda _: [])
-    with pytest.raises(ValueError, match="根节点"):
-        ai_service._extract_json("{}")
+    generated = {
+        "id": "nested",
+        "title": "nested",
+        "description": "nested",
+        "reference_solution": "print(1)",
+        "cpp_solution": "int main(){}",
+    }
+    normalized = ai_service._normalize_generated_payload(generated)
+    assert normalized["problem"]["id"] == "nested"
+    assert normalized["reference_solution"] == "print(1)"
+    assert normalized["reference_solution_cpp"] == "int main(){}"
 
     total = ai_service._empty_usage(_config())
     ai_service._merge_usage(total, {"input_tokens": 100, "output_tokens": 50}, _config())
     assert total["total_tokens"] == 150
     assert total["cost"] == 0.4
     assert total["estimated"] is False
+
+    detailed = ai_service._token_usage(
+        {
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "total_tokens": 30,
+            "prompt_tokens_details": {"cached_tokens": 4},
+            "completion_tokens_details": {"reasoning_tokens": 7},
+        }
+    )
+    assert detailed["cached_input_tokens"] == 4
+    assert detailed["reasoning_tokens"] == 7
+
+    qwen = AIModelConfigPayload(
+        provider_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen3.7-plus",
+        api_key="secret",
+    )
+    _FakeClient.response = _FakeResponse(
+        {"choices": [{"message": {"content": "answer"}}], "usage": {"total_tokens": 1}}
+    )
+    await ai_service._provider_request(qwen, [])
+    assert _FakeClient.last_json["enable_thinking"] is False
 
 
 async def test_private_ai_provider_rules(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
