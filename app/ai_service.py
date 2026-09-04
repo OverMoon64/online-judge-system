@@ -565,6 +565,24 @@ def _normalize_generated_payload(value: dict[str, Any]) -> dict[str, Any]:
     if isinstance(problem, dict):
         problem = dict(problem)
         normalized["problem"] = problem
+        for case_field in ("samples", "testcases"):
+            cases = problem.get(case_field)
+            if not isinstance(cases, list):
+                continue
+            normalized_cases = []
+            for case in cases:
+                if not isinstance(case, dict):
+                    normalized_cases.append(case)
+                    continue
+                normalized_case = dict(case)
+                if isinstance(normalized_case.get("input"), (int, float)):
+                    normalized_case["input"] = str(normalized_case["input"])
+                if "output" not in normalized_case:
+                    normalized_case["output"] = ""
+                elif isinstance(normalized_case.get("output"), (int, float)):
+                    normalized_case["output"] = str(normalized_case["output"])
+                normalized_cases.append(normalized_case)
+            problem[case_field] = normalized_cases
         for canonical, aliases in solution_fields.items():
             if canonical not in normalized:
                 for candidate in (canonical, *aliases):
@@ -577,6 +595,169 @@ def _normalize_generated_payload(value: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+_time_limit_pattern = re.compile(
+    r"(?:时间限制|限制时间|时限|运行时间(?:限制)?|time\s*limit)"
+    r"[^0-9]{0,16}([0-9]+(?:\.[0-9]+)?)\s*(?:秒|s\b)",
+    flags=re.IGNORECASE,
+)
+_memory_limit_pattern = re.compile(
+    r"(?:内存限制|限制内存|空间限制|内存|memory\s*limit)"
+    r"[^0-9]{0,16}([0-9]+(?:\.[0-9]+)?)\s*(gb|gib|mb|mib|兆|吉字节)",
+    flags=re.IGNORECASE,
+)
+_test_input_placeholder_pattern = re.compile(
+    r"(?:^|\s)\.\.\.(?:\s|$)|…|\bomitted\b|\bplaceholder\b|"
+    r"\bgenerate_[a-z0-9_]+\b|generated\s+by\s+(?:the\s+)?ref|省略|占位|待生成",
+    flags=re.IGNORECASE,
+)
+
+
+def _explicit_resource_limits(requirement: str) -> tuple[float | None, int | None]:
+    time_match = _time_limit_pattern.search(requirement)
+    memory_match = _memory_limit_pattern.search(requirement)
+    time_limit = float(time_match.group(1)) if time_match else None
+    memory_limit: int | None = None
+    if memory_match:
+        amount = float(memory_match.group(1))
+        unit = memory_match.group(2).lower()
+        if unit in {"gb", "gib", "吉字节"}:
+            amount *= 1024
+        memory_limit = int(round(amount))
+    if time_limit is not None and not 0 < time_limit <= 60:
+        raise ValueError("命题需求中的时间限制必须在 0 到 60 秒之间")
+    if memory_limit is not None and not 0 < memory_limit <= 4096:
+        raise ValueError("命题需求中的内存限制必须在 1 到 4096 MB 之间")
+    return time_limit, memory_limit
+
+
+def _recommended_resource_limits(
+    request: AIProblemTaskPayload, generated: GeneratedProblem | None = None
+) -> tuple[float, int, list[str]]:
+    difficulty_profiles = {
+        "入门": (1.0, 64),
+        "简单": (1.5, 128),
+        "中等": (2.0, 128),
+        "困难": (3.0, 256),
+    }
+    time_limit, memory_limit = difficulty_profiles.get(request.difficulty, (2.0, 128))
+    reasons = [f"难度为{request.difficulty or '未标注'}"]
+    context_parts = [request.requirement, request.difficulty, *request.knowledge_points]
+    if generated is not None:
+        context_parts.extend(
+            [
+                generated.problem.title,
+                generated.problem.description,
+                generated.problem.constraints,
+                generated.solution_explanation,
+                *generated.problem.tags,
+            ]
+        )
+    context = " ".join(context_parts).lower()
+    time_heavy = (
+        "回溯",
+        "状态压缩",
+        "网络流",
+        "最短路",
+        "复杂搜索",
+        "大规模",
+        "百万",
+        "线段树",
+        "后缀",
+    )
+    memory_heavy = (
+        "动态规划",
+        "状态压缩",
+        "图",
+        "网格",
+        "矩阵",
+        "bfs",
+        "dfs",
+        "搜索",
+        "并查集",
+        "最短路",
+    )
+    if any(keyword in context for keyword in time_heavy):
+        time_limit = max(time_limit, 3.0)
+        reasons.append("算法或数据规模偏重")
+    elif any(
+        keyword in context
+        for keyword in ("动态规划", "滑动窗口", "双指针", "排序", "bfs", "dfs", "搜索")
+    ):
+        time_limit = max(time_limit, 2.0)
+        reasons.append("需要遍历较大状态或数据结构")
+    if any(keyword in context for keyword in memory_heavy):
+        memory_limit = max(memory_limit, 256)
+        reasons.append("需要维护图、网格或状态结构")
+    return time_limit, memory_limit, reasons
+
+
+def _apply_resource_limit_policy(
+    generated: GeneratedProblem, request: AIProblemTaskPayload
+) -> dict[str, Any]:
+    explicit_time, explicit_memory = _explicit_resource_limits(request.requirement)
+    recommended_time, recommended_memory, reasons = _recommended_resource_limits(request, generated)
+    original_time = generated.problem.time_limit
+    original_memory = generated.problem.memory_limit
+    model_fields = generated.problem.model_fields_set
+    model_time = original_time if "time_limit" in model_fields else recommended_time
+    model_memory = original_memory if "memory_limit" in model_fields else recommended_memory
+    final_time = explicit_time if explicit_time is not None else max(model_time, recommended_time)
+    final_memory = (
+        explicit_memory if explicit_memory is not None else max(model_memory, recommended_memory)
+    )
+    generated.problem.time_limit = round(final_time, 2)
+    generated.problem.memory_limit = int(final_memory)
+    source = (
+        "explicit"
+        if explicit_time is not None and explicit_memory is not None
+        else "mixed"
+        if explicit_time is not None or explicit_memory is not None
+        else "automatic"
+    )
+    if explicit_time is not None:
+        reasons.append("采用需求中明确指定的时间限制")
+    if explicit_memory is not None:
+        reasons.append("采用需求中明确指定的内存限制")
+    return {
+        "source": source,
+        "requested": {"time_limit": explicit_time, "memory_limit": explicit_memory},
+        "model": {"time_limit": original_time, "memory_limit": original_memory},
+        "recommended_minimum": {
+            "time_limit": recommended_time,
+            "memory_limit": recommended_memory,
+        },
+        "final": {
+            "time_limit": generated.problem.time_limit,
+            "memory_limit": generated.problem.memory_limit,
+        },
+        "reasons": list(dict.fromkeys(reasons)),
+    }
+
+
+def _resource_limit_instruction(request: AIProblemTaskPayload) -> str:
+    explicit_time, explicit_memory = _explicit_resource_limits(request.requirement)
+    recommended_time, recommended_memory, _ = _recommended_resource_limits(request)
+    time_value = explicit_time if explicit_time is not None else recommended_time
+    memory_value = explicit_memory if explicit_memory is not None else recommended_memory
+    requirements = []
+    if explicit_time is not None:
+        requirements.append(f"time_limit 必须严格为 {explicit_time:g} 秒")
+    else:
+        requirements.append(
+            f"time_limit 不得低于系统按难度估算的 {recommended_time:g} 秒，可按复杂度提高"
+        )
+    if explicit_memory is not None:
+        requirements.append(f"memory_limit 必须严格为 {explicit_memory} MB")
+    else:
+        requirements.append(
+            f"memory_limit 不得低于系统按算法结构估算的 {recommended_memory} MB，可按空间复杂度提高"
+        )
+    return (
+        "；".join(requirements) + "。必须输出数值，不得机械套用固定的 1 秒/128 MB。"
+        f"JSON 中可从 time_limit={time_value:g}、memory_limit={memory_value} 开始评估。"
+    )
+
+
 def _generation_prompt(
     request: AIProblemTaskPayload, blueprint: str, existing: dict[str, Any] | None
 ) -> str:
@@ -586,6 +767,11 @@ def _generation_prompt(
         if request.testcase_count
         else "根据算法复杂度、边界规模和预计运行时长，生成 2 到 10 个互不重复的隐藏测试点"
     )
+    resource_requirement = _resource_limit_instruction(request)
+    prompt_time, prompt_memory, _ = _recommended_resource_limits(request)
+    explicit_time, explicit_memory = _explicit_resource_limits(request.requirement)
+    prompt_time = explicit_time if explicit_time is not None else prompt_time
+    prompt_memory = explicit_memory if explicit_memory is not None else prompt_memory
     return f"""
 你是程序设计训练课程的严谨命题专家。请根据命题需求和分析草案生成一道可直接导入 OJ 的题目。
 
@@ -593,6 +779,7 @@ def _generation_prompt(
 知识点：{", ".join(request.knowledge_points) or "由需求推断"}
 难度：{request.difficulty}
 {testcase_requirement}，覆盖最小值、最大值、特殊结构和能区分错误算法的数据。
+资源限制：{resource_requirement}
 参考已有题目：{existing_text}
 分析草案：{blueprint}
 
@@ -604,7 +791,7 @@ def _generation_prompt(
     "samples": [{{"input": "...", "output": "..."}}],
     "constraints": "数据范围", "testcases": [{{"input": "...", "output": "..."}}],
     "hint": "", "source": "AI 辅助命题", "tags": ["知识点"],
-    "time_limit": 1.0, "memory_limit": 128, "author": "AI Assistant",
+    "time_limit": {prompt_time:g}, "memory_limit": {prompt_memory}, "author": "AI Assistant",
     "difficulty": "{request.difficulty}"
   }},
     "reference_solution": "完整 Python 3 程序，换行必须写成 JSON 转义字符 \\n",
@@ -617,6 +804,9 @@ def _generation_prompt(
 大规模隐藏测试点不要求手算，无法可靠计算时 output 可以暂填空字符串，系统会交叉运行参考程序后校准。
 Python 与 C++ 必须按题意独立计算，严禁硬编码样例、隐藏测试输入或对应答案。
 测试点必须可以直接作为标准输入；除非输入格式明确允许，否则禁止使用空输入。
+input 字段必须包含完整的字面输入数据，严禁使用省略号、GENERATE_*、placeholder、
+“omitted for brevity”“由参考程序生成”等描述或宏。若完整大矩阵/长序列超过长度限制，
+应使用规模较小但结构有效的完整数据；只有题目输入格式本身定义了种子或紧凑表示时才能使用它。
 每个测试点的 input 和 output 均不得超过 2000 字符。大规模边界应使用紧凑的数字输入，
 不要展开数千个重复字符，也不要为了淘汰低效算法而生成超长字面量。整个 JSON 应简洁完整。
 所有字符串中的换行、制表符和控制字符都必须按 JSON 规则转义，禁止输出字面控制字符。
@@ -639,6 +829,30 @@ def _solution_repair_prompt(
     )
 
 
+def _test_data_repair_prompt(
+    generated: GeneratedProblem,
+    request: AIProblemTaskPayload,
+    *,
+    errors: list[str],
+) -> str:
+    problem_contract = generated.problem.model_dump(mode="json")
+    problem_contract.pop("samples", None)
+    problem_contract.pop("testcases", None)
+    target_count = request.testcase_count or len(generated.problem.testcases)
+    return (
+        "只修复样例和隐藏测试数据，不得修改题意、输入格式、参考程序或资源限制。"
+        "只返回严格 JSON 对象，且只能有 samples 和 testcases 两个根字段。\n"
+        f"题目契约：{json.dumps(problem_contract, ensure_ascii=False)}\n"
+        f"Python 参考程序：{generated.reference_solution}\n"
+        f"C++ 参考程序：{generated.reference_solution_cpp}\n"
+        f"需要 {target_count} 个互不重复的隐藏测试点，并保留至少一个答案准确、可人工核对的小样例。\n"
+        "每个 input 必须是可直接传给 stdin 的完整字面数据且不超过 2000 字符；严禁省略号、"
+        "GENERATE_*、placeholder、重复次数描述或任何待展开宏。矩阵、网格或长序列无法完整展开时，"
+        "应改用规模较小但结构完整的输入。隐藏 output 无法可靠手算时可以留空，系统会用双解共识回填。\n"
+        f"校验错误：{'; '.join(errors[:20])}"
+    )
+
+
 async def _validate_generated(
     generated: GeneratedProblem,
     request: AIProblemTaskPayload,
@@ -647,21 +861,35 @@ async def _validate_generated(
     calibration: dict[str, Any] = {"applied": False, "count": 0, "items": []}
     errors: list[str] = []
     if not 2 <= len(generated.problem.testcases) <= 10:
-        errors.append("隐藏测试点数量必须在 2 到 10 之间")
+        errors.append("测试数据 隐藏测试点数量必须在 2 到 10 之间")
     elif request.testcase_count and len(generated.problem.testcases) < request.testcase_count:
-        errors.append(f"测试点少于要求的 {request.testcase_count} 个")
+        errors.append(f"测试数据 测试点少于要求的 {request.testcase_count} 个")
     inputs = [case.input for case in generated.problem.testcases]
     if len(set(inputs)) != len(inputs):
-        errors.append("测试点输入存在重复")
+        errors.append("测试数据 隐藏测试点输入存在重复")
+    if not generated.problem.samples:
+        errors.append("测试数据 至少需要一个可人工核对的样例")
+    elif not any(case.output.strip() for case in generated.problem.samples):
+        errors.append("测试数据 至少一个样例必须提供非空的正确答案作为安全锚点")
+    total_test_data_length = 0
     for kind, cases in (
         ("样例", generated.problem.samples),
         ("测试点", generated.problem.testcases),
     ):
         for index, case in enumerate(cases, start=1):
-            if len(case.input) > 4_000:
-                errors.append(f"{kind} {index} 输入过长，请改为紧凑边界数据")
+            total_test_data_length += len(case.input) + len(case.output)
+            if len(case.input) > 2_000:
+                errors.append(f"测试数据 {kind} {index} 输入超过 2000 字符，请改为紧凑数据")
             if len(case.output) > 4_000:
-                errors.append(f"{kind} {index} 输出过长，请简化题目或测试数据")
+                errors.append(f"测试数据 {kind} {index} 输出过长，请简化题目或测试数据")
+            placeholder = _test_input_placeholder_pattern.search(case.input)
+            if placeholder:
+                errors.append(
+                    f"测试数据 {kind} {index} 含占位或省略内容 {placeholder.group(0)!r}；"
+                    "input 必须是可以直接传给标准输入的完整字面数据"
+                )
+    if total_test_data_length > 16_000:
+        errors.append("测试数据 总长度超过 16000 字符，请减少冗余并使用完整紧凑输入")
     if existing and generated.problem.id != existing.get("id"):
         errors.append("修改已有题目时不得改变题目 id")
     if errors:
@@ -878,14 +1106,17 @@ async def _run_problem_task(
         repair_count = 0
         errors: list[str] = []
         calibration: dict[str, Any] = {"applied": False, "count": 0, "items": []}
+        resource_limits: dict[str, Any] = {}
         candidate_content = content
         for validation_attempt in range(3):
             try:
                 generated = GeneratedProblem.model_validate(_extract_json(candidate_content))
+                resource_limits = _apply_resource_limit_policy(generated, request)
                 errors, calibration = await _validate_generated(generated, request, existing)
             except (ValidationError, ValueError, json.JSONDecodeError) as exc:
                 errors = [str(exc)]
                 calibration = {"applied": False, "count": 0, "items": []}
+                resource_limits = {}
                 generated = None
             if not errors:
                 break
@@ -894,12 +1125,17 @@ async def _run_problem_task(
             repair_count += 1
             validation_message = "; ".join(errors[:20])
             repair_language: str | None = None
+            repair_test_data = generated is not None and all(
+                error.startswith("测试数据 ") for error in errors
+            )
             if generated is not None and all(error.startswith("Python ") for error in errors):
                 repair_language = "Python"
             elif generated is not None and all(error.startswith("C++ ") for error in errors):
                 repair_language = "C++"
             repair_stage = (
-                f"定向修复 {repair_language} {repair_count}/2"
+                f"定向修复测试数据 {repair_count}/2"
+                if repair_test_data
+                else f"定向修复 {repair_language} {repair_count}/2"
                 if repair_language
                 else f"自动修正 {repair_count}/2"
             )
@@ -913,7 +1149,16 @@ async def _run_problem_task(
                     "stream_preview": "",
                 },
             )
-            if repair_language and generated is not None:
+            if repair_test_data and generated is not None:
+                repair_prompt = _test_data_repair_prompt(
+                    generated,
+                    request,
+                    errors=errors,
+                )
+                system_message = (
+                    "你是 OJ 测试数据审查员，只能返回 samples 和 testcases 的严格 JSON 对象。"
+                )
+            elif repair_language and generated is not None:
                 repair_prompt = _solution_repair_prompt(
                     generated,
                     language=repair_language,
@@ -940,7 +1185,17 @@ async def _run_problem_task(
             )
             _merge_stage_usage(usage, current_usage, config, repair_stage)
             await _record_model_usage(user_id, config_name, current_usage, config)
-            if repair_language and generated is not None:
+            if repair_test_data and generated is not None:
+                replacement = _extract_json(candidate_content)
+                samples = replacement.get("samples")
+                testcases = replacement.get("testcases")
+                if not isinstance(samples, list) or not isinstance(testcases, list):
+                    raise RuntimeError("测试数据定向修复未返回 samples 和 testcases 数组")
+                merged = generated.model_dump(mode="json")
+                merged["problem"]["samples"] = samples
+                merged["problem"]["testcases"] = testcases
+                candidate_content = json.dumps(merged, ensure_ascii=False)
+            elif repair_language and generated is not None:
                 replacement = _extract_json(candidate_content).get(
                     "reference_solution_cpp" if repair_language == "C++" else "reference_solution"
                 )
@@ -965,6 +1220,7 @@ async def _run_problem_task(
             "automatic_repair_used": repair_count > 0,
             "automatic_repair_count": repair_count,
             "output_calibration": calibration,
+            "resource_limits": resource_limits,
         }
         await _update_task(
             task_id,
