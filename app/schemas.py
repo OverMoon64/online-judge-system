@@ -102,9 +102,6 @@ class AIModelConfigPayload(StrictModel):
     price_unit: int = Field(default=1_000_000, gt=0)
     currency: str = Field(default="CNY", min_length=1, max_length=12)
     disable_thinking: bool = True
-    price_source: str = Field(default="manual", min_length=1, max_length=80)
-    price_source_url: str | None = Field(default=None, max_length=500)
-    pricing_note: str = Field(default="", max_length=500)
 
     @field_validator("name")
     @classmethod
@@ -123,16 +120,6 @@ class AIModelConfigPayload(StrictModel):
         if parsed.username or parsed.password:
             raise ValueError("provider_url must not contain credentials")
         return value.rstrip("/")
-
-    @field_validator("price_source_url")
-    @classmethod
-    def validate_price_source_url(cls, value: str | None) -> str | None:
-        if value is None or not value.strip():
-            return None
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("price_source_url must be an HTTP(S) URL")
-        return value.strip()
 
 
 class AIProblemTaskPayload(StrictModel):

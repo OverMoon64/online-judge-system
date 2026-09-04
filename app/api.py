@@ -558,19 +558,6 @@ async def read_ai_model_config(current_user: CurrentUser) -> dict[str, Any]:
     return success(config)
 
 
-@router.get("/api/ai/model-pricing")
-async def read_ai_model_pricing(request: Request, _: CurrentUser) -> dict[str, Any]:
-    provider_url = request.query_params.get("provider_url", "").strip()
-    model = request.query_params.get("model", "").strip()
-    if not provider_url or not model:
-        raise ApiError(400, "provider_url and model are required")
-    try:
-        pricing = ai_service.suggest_model_pricing(provider_url, model)
-    except ValueError as exc:
-        raise ApiError(404, str(exc)) from exc
-    return success(pricing)
-
-
 @router.get("/api/ai/model-configs/")
 async def list_ai_model_configs(current_user: CurrentUser) -> dict[str, Any]:
     return success(await ai_service.list_model_configs(current_user.id))

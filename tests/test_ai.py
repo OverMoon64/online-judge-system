@@ -57,35 +57,6 @@ async def test_provider_failure_retries_twice(monkeypatch):
     assert attempts == 3
 
 
-async def test_known_model_pricing_and_manual_fallback(client: httpx.AsyncClient) -> None:
-    assert (
-        await client.get(
-            "/api/ai/model-pricing",
-            params={
-                "provider_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                "model": "qwen3.7-plus",
-            },
-        )
-    ).status_code == 401
-    await login(client)
-    known = await client.get(
-        "/api/ai/model-pricing",
-        params={
-            "provider_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "model": "qwen3.7-plus",
-        },
-    )
-    assert known.status_code == 200
-    assert known.json()["data"]["input_price"] == 1.6
-    assert known.json()["data"]["output_price"] == 6.4
-    assert known.json()["data"]["currency"] == "CNY"
-    unknown = await client.get(
-        "/api/ai/model-pricing",
-        params={"provider_url": "https://example.test/v1", "model": "custom-model"},
-    )
-    assert unknown.status_code == 404
-
-
 async def test_stream_preview_callback_updates_running_task(monkeypatch):
     updates: list[dict] = []
 
@@ -316,6 +287,55 @@ async def test_ai_invalid_draft_is_repaired_and_provider_failure_is_reported(
     failed = await _wait_task(client, response.json()["data"]["task_id"])
     assert failed["status"] == "failed"
     assert failed["error"] == "provider unavailable"
+
+
+async def test_ai_repairs_only_the_failing_reference_language(
+    client: httpx.AsyncClient, monkeypatch
+) -> None:
+    await login(client)
+    await client.put(
+        "/api/ai/model-config",
+        json={
+            "provider_url": "https://example-model-provider.test/v1",
+            "model": "targeted-repair-model",
+            "api_key": "secret",
+        },
+    )
+    correct_cpp = generated_payload()["reference_solution_cpp"]
+    calls = 0
+
+    async def targeted_provider(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "边界条件分析", {"input_tokens": 1, "output_tokens": 1}
+        if calls == 2:
+            draft = generated_payload()
+            draft["reference_solution_cpp"] = "int main(){return 0;}"
+            return json.dumps(draft, ensure_ascii=False), {
+                "input_tokens": 2,
+                "output_tokens": 2,
+            }
+        return json.dumps({"reference_solution_cpp": correct_cpp}, ensure_ascii=False), {
+            "input_tokens": 3,
+            "output_tokens": 3,
+        }
+
+    monkeypatch.setattr(ai_service, "_provider_request", targeted_provider)
+    response = await client.post(
+        "/api/ai/problem-tasks/",
+        json={
+            "requirement": "设计一道能验证 C++ 定向修复的三数求和题",
+            "testcase_count": 3,
+        },
+    )
+    repaired = await _wait_task(client, response.json()["data"]["task_id"])
+
+    assert repaired["status"] == "completed", repaired
+    assert repaired["result"]["reference_solution_cpp"] == correct_cpp
+    assert repaired["result"]["validation"]["automatic_repair_count"] == 1
+    assert repaired["usage"]["calls"][-1]["stage"] == "定向修复 C++ 1/2"
+    assert calls == 3
 
 
 async def test_ai_task_is_private_to_creator(client: httpx.AsyncClient, monkeypatch) -> None:

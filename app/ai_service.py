@@ -49,9 +49,6 @@ def _public_config(
         "price_unit": config.price_unit,
         "currency": config.currency,
         "disable_thinking": config.disable_thinking,
-        "price_source": config.price_source,
-        "price_source_url": config.price_source_url,
-        "pricing_note": config.pricing_note,
         "active": active,
         "usage": usage
         or {
@@ -123,7 +120,13 @@ async def _ensure_model_store_loaded() -> None:
                 for user_id_text, stored in payload.get("users", {}).items():
                     user_id = int(user_id_text)
                     configs = {
-                        name: AIModelConfigPayload.model_validate(config)
+                        name: AIModelConfigPayload.model_validate(
+                            {
+                                key: value
+                                for key, value in config.items()
+                                if key in AIModelConfigPayload.model_fields
+                            }
+                        )
                         for name, config in stored.get("models", {}).items()
                     }
                     if configs:
@@ -219,55 +222,12 @@ def _completion_endpoint(base_url: str) -> str:
     return base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
 
 
-def suggest_model_pricing(provider_url: str, model: str) -> dict[str, Any]:
-    host = (urlparse(provider_url).hostname or "").lower()
-    normalized_model = model.strip().lower()
-    if "aliyuncs.com" not in host:
-        raise ValueError("该 OpenAI-compatible 服务没有可识别的公开计价表，请手动填写")
-
-    international = "dashscope-intl" in host
-    source_url = "https://help.aliyun.com/zh/model-studio/model-pricing"
-    common = {
-        "price_unit": 1_000_000,
-        "currency": "CNY",
-        "price_source": "阿里云百炼官方模型价格",
-        "price_source_url": source_url,
-        "as_of": "2026-09-04",
-    }
-    if normalized_model.startswith("qwen3.7-plus"):
-        if international:
-            input_price, output_price = 2.998, 11.991
-            region = "国际站"
-        elif normalized_model == "qwen3.7-plus":
-            input_price, output_price = 1.6, 6.4
-            region = "中国站限时折扣"
-        else:
-            input_price, output_price = 2.0, 8.0
-            region = "中国站快照版"
-        tier = "单次请求输入不超过 256K Token"
-    elif normalized_model.startswith("qwen3.7-flash"):
-        if international:
-            input_price, output_price = 0.225, 0.974
-            region = "国际站"
-        else:
-            input_price, output_price = 0.2, 0.8
-            region = "中国站"
-        tier = "单次请求输入不超过 32K Token"
-    else:
-        raise ValueError("该模型暂无内置官方价格预设，请按服务商控制台手动填写")
-    return {
-        **common,
-        "input_price": input_price,
-        "output_price": output_price,
-        "pricing_note": f"{region}，{tier}；阶梯、缓存和后续调价请以官方控制台为准。",
-    }
-
-
 async def _provider_request(
     config: AIModelConfigPayload,
     messages: list[dict[str, str]],
     *,
     on_delta: StreamCallback | None = None,
+    json_mode: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     payload = {
@@ -276,12 +236,15 @@ async def _provider_request(
         "temperature": 0.35,
     }
     provider_host = (urlparse(config.provider_url).hostname or "").lower()
-    if (
-        config.disable_thinking
-        and config.model.lower().startswith("qwen")
-        and "aliyuncs.com" in provider_host
-    ):
-        payload["enable_thinking"] = False
+    is_dashscope_qwen = config.model.lower().startswith("qwen") and (
+        "aliyuncs.com" in provider_host
+    )
+    if is_dashscope_qwen:
+        payload["max_completion_tokens"] = 12_000
+        if config.disable_thinking:
+            payload["enable_thinking"] = False
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
             endpoint = _completion_endpoint(config.provider_url)
@@ -324,10 +287,16 @@ async def _provider_request_with_retry(
     *,
     retry_count: int = 2,
     on_delta: StreamCallback | None = None,
+    json_mode: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     for attempt in range(retry_count + 1):
         try:
-            content, usage = await _provider_request(config, messages, on_delta=on_delta)
+            content, usage = await _provider_request(
+                config,
+                messages,
+                on_delta=on_delta,
+                json_mode=json_mode,
+            )
             usage = dict(usage)
             usage["request_count"] = attempt + 1
             if attempt:
@@ -364,10 +333,14 @@ def _token_usage(value: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _parse_non_stream_response(body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    content = body["choices"][0]["message"]["content"]
+    choice = body["choices"][0]
+    content = choice["message"]["content"]
     if not isinstance(content, str) or not content:
         raise ValueError("model response content is empty")
-    return content, _token_usage(body.get("usage"))
+    usage = _token_usage(body.get("usage"))
+    if choice.get("finish_reason"):
+        usage["finish_reason"] = choice["finish_reason"]
+    return content, usage
 
 
 def _delta_text(value: Any) -> str:
@@ -389,6 +362,7 @@ async def _consume_stream_response(
     content_parts: list[str] = []
     raw_lines: list[str] = []
     usage = _token_usage(None)
+    finish_reason: str | None = None
     received_event = False
     async for line in response.aiter_lines():
         stripped = line.strip()
@@ -407,7 +381,10 @@ async def _consume_stream_response(
         choices = event.get("choices") or []
         if not choices:
             continue
-        delta = _delta_text((choices[0].get("delta") or {}).get("content"))
+        choice = choices[0]
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+        delta = _delta_text((choice.get("delta") or {}).get("content"))
         if delta:
             content_parts.append(delta)
             if on_delta:
@@ -417,6 +394,8 @@ async def _consume_stream_response(
     content = "".join(content_parts)
     if not content:
         raise ValueError("model stream content is empty")
+    if finish_reason:
+        usage["finish_reason"] = finish_reason
     return content, usage
 
 
@@ -483,6 +462,7 @@ def _merge_stage_usage(
             "output_tokens": int(current.get("output_tokens", 0) or 0),
             "reasoning_tokens": int(current.get("reasoning_tokens", 0) or 0),
             "request_count": int(current.get("request_count", 1) or 1),
+            "finish_reason": current.get("finish_reason"),
         }
     )
 
@@ -600,7 +580,7 @@ def _normalize_generated_payload(value: dict[str, Any]) -> dict[str, Any]:
 def _generation_prompt(
     request: AIProblemTaskPayload, blueprint: str, existing: dict[str, Any] | None
 ) -> str:
-    existing_text = json.dumps(existing, ensure_ascii=False) if existing else "无"
+    existing_text = json.dumps(existing, ensure_ascii=False)[:8_000] if existing else "无"
     testcase_requirement = (
         f"生成至少 {request.testcase_count} 个互不重复的隐藏测试点"
         if request.testcase_count
@@ -612,7 +592,7 @@ def _generation_prompt(
 命题需求：{request.requirement}
 知识点：{", ".join(request.knowledge_points) or "由需求推断"}
 难度：{request.difficulty}
-{testcase_requirement}，必须包含最小值、最大值、特殊结构和能区分低效算法的数据。
+{testcase_requirement}，覆盖最小值、最大值、特殊结构和能区分错误算法的数据。
 参考已有题目：{existing_text}
 分析草案：{blueprint}
 
@@ -632,8 +612,46 @@ def _generation_prompt(
   "solution_explanation": "正确性和复杂度说明"
 }}
 两个参考程序必须使用相同算法并对所有 output 给出一致结果；Python 只能使用标准库，C++ 使用 C++14。
+测试点必须可以直接作为标准输入；除非输入格式明确允许，否则禁止使用空输入。
+每个测试点的 input 和 output 均不得超过 2000 字符。大规模边界应使用紧凑的数字输入，
+不要展开数千个重复字符，也不要为了淘汰低效算法而生成超长字面量。整个 JSON 应简洁完整。
 所有字符串中的换行、制表符和控制字符都必须按 JSON 规则转义，禁止输出字面控制字符。
 """.strip()
+
+
+def _add_testcase_context(
+    errors: list[str],
+    generated: GeneratedProblem,
+    *,
+    language: str,
+) -> list[str]:
+    enriched: list[str] = []
+    for error in errors:
+        message = f"{language} {error}"
+        match = re.search(r"testcase\s+(\d+)", error, flags=re.IGNORECASE)
+        if match:
+            index = int(match.group(1)) - 1
+            if 0 <= index < len(generated.problem.testcases):
+                case = generated.problem.testcases[index]
+                message += f"; input={case.input[:240]!r}; expected={case.output[:240]!r}"
+        enriched.append(message)
+    return enriched
+
+
+def _solution_repair_prompt(
+    generated: GeneratedProblem,
+    *,
+    language: str,
+    errors: list[str],
+) -> str:
+    key = "reference_solution_cpp" if language == "C++" else "reference_solution"
+    problem = generated.problem.model_dump(mode="json")
+    return (
+        f"只修复 {language} 参考程序。只返回严格 JSON 对象，唯一根字段为 {key}。\n"
+        "程序必须按题面读取标准输入，对每个测试点都输出结果；不得修改题面或测试点。\n"
+        f"题目和测试点：{json.dumps(problem, ensure_ascii=False)}\n"
+        f"校验错误：{'; '.join(errors[:20])}"
+    )
 
 
 async def _validate_generated(
@@ -649,17 +667,23 @@ async def _validate_generated(
     inputs = [case.input for case in generated.problem.testcases]
     if len(set(inputs)) != len(inputs):
         errors.append("测试点输入存在重复")
+    for index, case in enumerate(generated.problem.testcases, start=1):
+        if len(case.input) > 4_000:
+            errors.append(f"测试点 {index} 输入过长，请改为紧凑边界数据")
+        if len(case.output) > 4_000:
+            errors.append(f"测试点 {index} 输出过长，请简化题目或测试数据")
     if existing and generated.problem.id != existing.get("id"):
         errors.append("修改已有题目时不得改变题目 id")
-    errors.extend(
-        await validate_reference_solution(generated.problem, generated.reference_solution)
+    python_errors = await validate_reference_solution(
+        generated.problem, generated.reference_solution
     )
+    errors.extend(_add_testcase_context(python_errors, generated, language="Python"))
     cpp_errors = await validate_reference_solution(
         generated.problem,
         generated.reference_solution_cpp,
         language="cpp",
     )
-    errors.extend(f"C++ {error}" for error in cpp_errors)
+    errors.extend(_add_testcase_context(cpp_errors, generated, language="C++"))
     return errors
 
 
@@ -720,6 +744,7 @@ async def _run_problem_task(
                 {"role": "user", "content": _generation_prompt(request, blueprint, existing)},
             ],
             on_delta=_stream_preview_callback(task_id, "题面、解法与测试点"),
+            json_mode=True,
         )
         _merge_stage_usage(usage, current_usage, config, "题面、解法与测试点")
         await _record_model_usage(user_id, config_name, current_usage, config)
@@ -747,34 +772,66 @@ async def _run_problem_task(
                 raise RuntimeError("两次自动修正后仍未通过校验：" + "; ".join(errors[:20]))
             repair_count += 1
             validation_message = "; ".join(errors[:20])
+            repair_language: str | None = None
+            if generated is not None and all(error.startswith("Python ") for error in errors):
+                repair_language = "Python"
+            elif generated is not None and all(error.startswith("C++ ") for error in errors):
+                repair_language = "C++"
+            repair_stage = (
+                f"定向修复 {repair_language} {repair_count}/2"
+                if repair_language
+                else f"自动修正 {repair_count}/2"
+            )
             await _update_task(
                 task_id,
-                progress=f"初稿未通过校验，正在进行第 {repair_count}/2 次自动修正",
+                progress=f"初稿未通过校验，正在进行第 {repair_count}/2 次修正",
                 progress_percent=80 + repair_count * 7,
                 usage=usage,
                 result={
-                    "stream_stage": f"自动修正 {repair_count}/2",
+                    "stream_stage": repair_stage,
                     "stream_preview": "",
                 },
             )
-            repair_prompt = (
-                _generation_prompt(request, blueprint, existing)
-                + "\n\n上一稿未通过校验，请根据错误从头生成完整 JSON，不要省略任何根字段。"
-                + f"\n校验错误：{validation_message}"
-            )
+            if repair_language and generated is not None:
+                repair_prompt = _solution_repair_prompt(
+                    generated,
+                    language=repair_language,
+                    errors=errors,
+                )
+                system_message = (
+                    "你是 OJ 参考程序审查员，只能返回包含指定参考程序的严格 JSON 对象。"
+                )
+            else:
+                repair_prompt = (
+                    _generation_prompt(request, blueprint, existing)
+                    + "\n\n上一稿未通过校验，请根据错误从头生成完整 JSON，"
+                    "不要省略任何根字段。" + f"\n校验错误：{validation_message}"
+                )
+                system_message = "你是 OJ 题目质量审查员，只能返回完整、严格的 JSON 对象。"
             candidate_content, current_usage = await _provider_request_with_retry(
                 config,
                 [
-                    {
-                        "role": "system",
-                        "content": "你是 OJ 题目质量审查员，只能返回完整、严格的 JSON 对象。",
-                    },
+                    {"role": "system", "content": system_message},
                     {"role": "user", "content": repair_prompt},
                 ],
-                on_delta=_stream_preview_callback(task_id, f"自动修正 {repair_count}/2"),
+                on_delta=_stream_preview_callback(task_id, repair_stage),
+                json_mode=True,
             )
-            _merge_stage_usage(usage, current_usage, config, f"自动修正 {repair_count}/2")
+            _merge_stage_usage(usage, current_usage, config, repair_stage)
             await _record_model_usage(user_id, config_name, current_usage, config)
+            if repair_language and generated is not None:
+                replacement = _extract_json(candidate_content).get(
+                    "reference_solution_cpp" if repair_language == "C++" else "reference_solution"
+                )
+                if not isinstance(replacement, str) or not replacement.strip():
+                    raise RuntimeError(f"{repair_language} 定向修复未返回参考程序")
+                if repair_language == "C++":
+                    generated.reference_solution_cpp = replacement
+                else:
+                    generated.reference_solution = replacement
+                candidate_content = json.dumps(
+                    generated.model_dump(mode="json"), ensure_ascii=False
+                )
 
         assert generated is not None
         generated.problem.author = config.model

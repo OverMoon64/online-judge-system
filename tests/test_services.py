@@ -278,8 +278,10 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     _FakeClient.response = _FakeResponse(
         {"choices": [{"message": {"content": "answer"}}], "usage": {"total_tokens": 1}}
     )
-    await ai_service._provider_request(qwen, [])
+    await ai_service._provider_request(qwen, [], json_mode=True)
     assert _FakeClient.last_json["enable_thinking"] is False
+    assert _FakeClient.last_json["max_completion_tokens"] == 12_000
+    assert _FakeClient.last_json["response_format"] == {"type": "json_object"}
 
 
 async def test_private_ai_provider_rules(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
