@@ -463,6 +463,17 @@ async def execute_reference_solution(
         return ReferenceExecution(language, None, results)
 
 
+async def execute_input_generator(source_code: str) -> ProcessResult:
+    """Run a deterministic AI-authored input generator inside judge limits."""
+
+    with tempfile.TemporaryDirectory(prefix="oj-ai-generator-") as temp_name:
+        source = Path(temp_name) / "generator.py"
+        await asyncio.to_thread(source.write_text, source_code, encoding="utf-8")
+        result = await run_process(["python3", str(source)], "", 3.0, 256)
+        result.stderr = _sanitize_message(result.stderr, temp_name)
+        return result
+
+
 async def submission_exists(submission_id: int) -> bool:
     async with database.session_factory() as session:
         return (
