@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from app import db as database
 from app.config import get_settings
 from app.db import AIProblemTask, Problem, utc_now
-from app.judge import validate_reference_solution
+from app.judge import ReferenceExecution, execute_reference_solution, normalize_output
 from app.schemas import AIModelConfigPayload, AIProblemTaskPayload, GeneratedProblem
 
 _model_configs: dict[int, dict[str, AIModelConfigPayload]] = {}
@@ -612,30 +612,15 @@ def _generation_prompt(
   "solution_explanation": "正确性和复杂度说明"
 }}
 两个参考程序必须使用相同算法并对所有 output 给出一致结果；Python 只能使用标准库，C++ 使用 C++14。
+若题目涉及递推数列，必须在题面和解法中明确 F(0)/F(1) 或 F(1)/F(2) 等下标定义。
+至少提供一个答案可人工核对的小规模样例，且该样例 output 必须准确且非空，作为题意安全锚点。
+大规模隐藏测试点不要求手算，无法可靠计算时 output 可以暂填空字符串，系统会交叉运行参考程序后校准。
+Python 与 C++ 必须按题意独立计算，严禁硬编码样例、隐藏测试输入或对应答案。
 测试点必须可以直接作为标准输入；除非输入格式明确允许，否则禁止使用空输入。
 每个测试点的 input 和 output 均不得超过 2000 字符。大规模边界应使用紧凑的数字输入，
 不要展开数千个重复字符，也不要为了淘汰低效算法而生成超长字面量。整个 JSON 应简洁完整。
 所有字符串中的换行、制表符和控制字符都必须按 JSON 规则转义，禁止输出字面控制字符。
 """.strip()
-
-
-def _add_testcase_context(
-    errors: list[str],
-    generated: GeneratedProblem,
-    *,
-    language: str,
-) -> list[str]:
-    enriched: list[str] = []
-    for error in errors:
-        message = f"{language} {error}"
-        match = re.search(r"testcase\s+(\d+)", error, flags=re.IGNORECASE)
-        if match:
-            index = int(match.group(1)) - 1
-            if 0 <= index < len(generated.problem.testcases):
-                case = generated.problem.testcases[index]
-                message += f"; input={case.input[:240]!r}; expected={case.output[:240]!r}"
-        enriched.append(message)
-    return enriched
 
 
 def _solution_repair_prompt(
@@ -658,7 +643,8 @@ async def _validate_generated(
     generated: GeneratedProblem,
     request: AIProblemTaskPayload,
     existing: dict[str, Any] | None,
-) -> list[str]:
+) -> tuple[list[str], dict[str, Any]]:
+    calibration: dict[str, Any] = {"applied": False, "count": 0, "items": []}
     errors: list[str] = []
     if not 2 <= len(generated.problem.testcases) <= 10:
         errors.append("隐藏测试点数量必须在 2 到 10 之间")
@@ -667,23 +653,156 @@ async def _validate_generated(
     inputs = [case.input for case in generated.problem.testcases]
     if len(set(inputs)) != len(inputs):
         errors.append("测试点输入存在重复")
-    for index, case in enumerate(generated.problem.testcases, start=1):
-        if len(case.input) > 4_000:
-            errors.append(f"测试点 {index} 输入过长，请改为紧凑边界数据")
-        if len(case.output) > 4_000:
-            errors.append(f"测试点 {index} 输出过长，请简化题目或测试数据")
+    for kind, cases in (
+        ("样例", generated.problem.samples),
+        ("测试点", generated.problem.testcases),
+    ):
+        for index, case in enumerate(cases, start=1):
+            if len(case.input) > 4_000:
+                errors.append(f"{kind} {index} 输入过长，请改为紧凑边界数据")
+            if len(case.output) > 4_000:
+                errors.append(f"{kind} {index} 输出过长，请简化题目或测试数据")
     if existing and generated.problem.id != existing.get("id"):
         errors.append("修改已有题目时不得改变题目 id")
-    python_errors = await validate_reference_solution(
-        generated.problem, generated.reference_solution
+    if errors:
+        return errors, calibration
+
+    cases = [
+        *(("sample", index, case) for index, case in enumerate(generated.problem.samples, 1)),
+        *(("testcase", index, case) for index, case in enumerate(generated.problem.testcases, 1)),
+    ]
+    case_inputs = [case.input for _, _, case in cases]
+    python_execution = await execute_reference_solution(
+        generated.problem,
+        generated.reference_solution,
+        inputs=case_inputs,
     )
-    errors.extend(_add_testcase_context(python_errors, generated, language="Python"))
-    cpp_errors = await validate_reference_solution(
+    cpp_execution = await execute_reference_solution(
         generated.problem,
         generated.reference_solution_cpp,
         language="cpp",
+        inputs=case_inputs,
     )
-    errors.extend(_add_testcase_context(cpp_errors, generated, language="C++"))
+    python_errors = _reference_execution_errors(python_execution, cases, "Python")
+    cpp_errors = _reference_execution_errors(cpp_execution, cases, "C++")
+    if python_errors or cpp_errors:
+        if python_errors and cpp_errors:
+            return [*python_errors, *cpp_errors], calibration
+        return (python_errors or cpp_errors), calibration
+
+    python_outputs = [normalize_output(result.stdout) for result in python_execution.results]
+    cpp_outputs = [normalize_output(result.stdout) for result in cpp_execution.results]
+    disagreements = [
+        index
+        for index, (python_output, cpp_output) in enumerate(
+            zip(python_outputs, cpp_outputs, strict=True)
+        )
+        if python_output != cpp_output
+    ]
+    if disagreements:
+        originals = [normalize_output(case.output) for _, _, case in cases]
+        nonblank = [index for index, value in enumerate(originals) if value]
+        python_matches = bool(nonblank) and all(
+            originals[index] == python_outputs[index] for index in nonblank
+        )
+        cpp_matches = bool(nonblank) and all(
+            originals[index] == cpp_outputs[index] for index in nonblank
+        )
+        if python_matches != cpp_matches:
+            failing_language = "C++" if python_matches else "Python"
+            failing_outputs = cpp_outputs if python_matches else python_outputs
+            trusted_outputs = python_outputs if python_matches else cpp_outputs
+            targeted_errors = []
+            for case_index in disagreements:
+                kind, index, case = cases[case_index]
+                targeted_errors.append(
+                    f"{failing_language} {_case_label(kind, index)}: 与另一语言和原答案不一致; "
+                    f"input={case.input[:240]!r}; actual={failing_outputs[case_index][:240]!r}; "
+                    f"trusted={trusted_outputs[case_index][:240]!r}"
+                )
+            return targeted_errors, calibration
+        disagreement_errors = []
+        for case_index in disagreements:
+            kind, index, case = cases[case_index]
+            disagreement_errors.append(
+                f"双解输出不一致 {_case_label(kind, index)}; input={case.input[:240]!r}; "
+                f"Python stdout={python_outputs[case_index][:240]!r}; "
+                f"C++ stdout={cpp_outputs[case_index][:240]!r}"
+            )
+        return disagreement_errors, calibration
+
+    originals = [normalize_output(case.output) for _, _, case in cases]
+    anchor_exists = any(
+        original and original == consensus
+        for original, consensus in zip(originals, python_outputs, strict=True)
+    )
+    changes = [
+        case_index
+        for case_index, (original, consensus) in enumerate(
+            zip(originals, python_outputs, strict=True)
+        )
+        if original != consensus
+    ]
+    if changes and not anchor_exists:
+        diagnostics = []
+        for case_index in changes[:6]:
+            kind, index, case = cases[case_index]
+            diagnostics.append(
+                f"{_case_label(kind, index)} input={case.input[:240]!r}; "
+                f"original={case.output[:240]!r}; consensus={python_outputs[case_index][:240]!r}"
+            )
+        return [
+            "Python/C++ 输出一致，但不存在与双解结果一致的非空安全锚点，禁止自动回填；"
+            + "; ".join(diagnostics)
+        ], calibration
+
+    oversized = [index for index in changes if len(python_outputs[index]) > 4_000]
+    if oversized:
+        kind, index, case = cases[oversized[0]]
+        return [
+            f"{_case_label(kind, index)} 双解输出超过 4000 字符，禁止自动回填; "
+            f"input={case.input[:240]!r}"
+        ], calibration
+
+    items: list[dict[str, Any]] = []
+    for case_index in changes:
+        kind, index, case = cases[case_index]
+        calibrated_output = python_outputs[case_index]
+        items.append(
+            {
+                "kind": kind,
+                "index": index,
+                "input": case.input,
+                "original_output": case.output,
+                "calibrated_output": calibrated_output,
+            }
+        )
+        case.output = calibrated_output
+    calibration = {"applied": bool(items), "count": len(items), "items": items}
+    return [], calibration
+
+
+def _case_label(kind: str, index: int) -> str:
+    return f"{'sample' if kind == 'sample' else 'testcase'} {index}"
+
+
+def _reference_execution_errors(
+    execution: ReferenceExecution,
+    cases: list[tuple[str, int, Any]],
+    language: str,
+) -> list[str]:
+    if execution.setup_error:
+        return [f"{language} {execution.setup_error}"]
+    errors: list[str] = []
+    for (kind, index, case), result in zip(cases, execution.results, strict=True):
+        if result.status == "OK":
+            continue
+        detail = result.stderr or result.stdout or result.status
+        errors.append(
+            f"{language} {_case_label(kind, index)}: {result.status}; "
+            f"input={case.input[:240]!r}; stdout={result.stdout[:240]!r}; "
+            f"error={detail[:240]!r}"
+        )
     return errors
 
 
@@ -751,20 +870,22 @@ async def _run_problem_task(
 
         await _update_task(
             task_id,
-            progress="正在校验字段、测试点和参考解法",
+            progress="正在交叉运行 Python/C++ 参考解法并校准答案",
             progress_percent=75,
             usage=usage,
         )
         generated: GeneratedProblem | None = None
         repair_count = 0
         errors: list[str] = []
+        calibration: dict[str, Any] = {"applied": False, "count": 0, "items": []}
         candidate_content = content
         for validation_attempt in range(3):
             try:
                 generated = GeneratedProblem.model_validate(_extract_json(candidate_content))
-                errors = await _validate_generated(generated, request, existing)
+                errors, calibration = await _validate_generated(generated, request, existing)
             except (ValidationError, ValueError, json.JSONDecodeError) as exc:
                 errors = [str(exc)]
+                calibration = {"applied": False, "count": 0, "items": []}
                 generated = None
             if not errors:
                 break
@@ -843,11 +964,12 @@ async def _run_problem_task(
             "reference_languages": ["python", "cpp"],
             "automatic_repair_used": repair_count > 0,
             "automatic_repair_count": repair_count,
+            "output_calibration": calibration,
         }
         await _update_task(
             task_id,
             status="completed",
-            progress="命题完成，已通过结构和参考解法校验",
+            progress="命题完成，已通过双语言交叉校验",
             progress_percent=100,
             usage=usage,
             result=result,
