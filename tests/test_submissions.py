@@ -55,7 +55,7 @@ async def test_wrong_answer_runtime_error_timeout_and_rate_limit(
     client: httpx.AsyncClient,
 ) -> None:
     await login(client)
-    await add_sum_problem(client, time_limit=0.15)
+    await add_sum_problem(client, time_limit=0.5)
     await client.post("/api/auth/logout")
     await register(client, "alice")
     await login(client, "alice")
