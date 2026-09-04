@@ -30,17 +30,27 @@ st.set_page_config(page_title="在线评测系统", page_icon="⚖️", layout="
 
 DEFAULT_API_BASE_URL = normalize_base_url(os.getenv("OJ_API_BASE_URL", "http://127.0.0.1:8000"))
 ROLE_LABELS = {"admin": "管理员", "user": "普通用户", "banned": "已封禁"}
+STATUS_LABELS = {
+    "AC": "AC · 通过",
+    "WA": "WA · 答案错误",
+    "TLE": "TLE · 超出时间限制",
+    "MLE": "MLE · 超出内存限制",
+    "RE": "RE · 运行时错误",
+    "CE": "CE · 编译错误",
+    "UNK": "UNK · 未知错误",
+    "pending": "Pending · 评测中",
+    "error": "Error · 任务异常",
+}
 STATUS_STYLES = {
     "AC": ("#067647", "#ecfdf3"),
     "WA": ("#b42318", "#fef3f2"),
     "TLE": ("#b54708", "#fffaeb"),
     "MLE": ("#6941c6", "#f4f3ff"),
     "RE": ("#c11574", "#fdf2fa"),
-    "CE": ("#344054", "#f2f4f7"),
+    "CE": ("#3538cd", "#eef4ff"),
     "UNK": ("#475467", "#f2f4f7"),
     "pending": ("#175cd3", "#eff8ff"),
     "error": ("#b42318", "#fef3f2"),
-    "未通过": ("#b42318", "#fef3f2"),
 }
 
 
@@ -123,9 +133,10 @@ def role_label(role: str) -> str:
 
 def status_badge(status: str) -> str:
     foreground, background = STATUS_STYLES.get(status, ("#344054", "#f2f4f7"))
+    label = STATUS_LABELS.get(status, status)
     return (
         f'<span class="oj-badge" style="color:{foreground};background:{background};">'
-        f"{escape(status)}</span>"
+        f"{escape(label)}</span>"
     )
 
 
@@ -134,9 +145,23 @@ def submission_verdict(data: dict[str, Any]) -> str:
         return "pending"
     if data.get("status") == "error":
         return "error"
+    result = str(data.get("result") or "").upper()
+    if result in {"AC", "WA", "TLE", "MLE", "RE", "CE", "UNK"}:
+        return result
+    details = data.get("details") or []
+    for case in details:
+        case_result = str(case.get("result") or "UNK").upper()
+        if case_result != "AC":
+            return case_result if case_result in STATUS_STYLES else "UNK"
+    if details:
+        return "AC"
+    if (data.get("compile_info") or {}).get("result") == "failed":
+        return "CE"
     if data.get("counts") and data.get("score") == data.get("counts"):
         return "AC"
-    return "未通过"
+    if data.get("counts") is not None and data.get("score", 0) < data.get("counts", 0):
+        return "WA"
+    return "UNK"
 
 
 def api_call(method: str, path: str, *, quiet: bool = False, **kwargs: Any) -> dict[str, Any]:
@@ -379,16 +404,65 @@ def load_problem_overviews(
             else 0
         )
         accepted = any(submission_verdict(record) == "AC" for record in submissions)
+        latest_verdict = submission_verdict(submissions[0]) if submissions else None
         state = "✅ 已通过" if accepted else ("🟠 已尝试" if attempts else "⚪ 未尝试")
         overviews.append(
             {
                 "detail": detail_result["data"],
                 "attempts": attempts,
                 "accepted": accepted,
+                "latest_verdict": latest_verdict,
                 "state": state,
             }
         )
     return overviews
+
+
+def render_problem_statement(
+    data: dict[str, Any], *, attempts: int | None = None, state: str | None = None
+) -> None:
+    with st.container(border=True):
+        st.subheader(f"{data['id']} · {data['title']}")
+        metadata = [
+            f"难度：{data.get('difficulty') or '未标注'}",
+            f"来源：{data.get('source') or '课程题库'}",
+        ]
+        if state:
+            metadata.append(state)
+        st.caption(" · ".join(metadata))
+
+        limit_columns = st.columns(4 if attempts is not None else 3)
+        limit_columns[0].metric("时间限制", f"{data['time_limit']} s")
+        limit_columns[1].metric("内存限制", f"{data['memory_limit']} MB")
+        limit_columns[2].metric("测试点", len(data.get("testcases") or []))
+        if attempts is not None:
+            limit_columns[3].metric("个人提交", attempts)
+
+        st.markdown("#### 题目描述")
+        st.markdown(data["description"])
+        info_left, info_right = st.columns(2)
+        with info_left:
+            st.markdown("**输入格式**")
+            st.markdown(data["input_description"])
+        with info_right:
+            st.markdown("**输出格式**")
+            st.markdown(data["output_description"])
+        st.markdown("**数据范围**")
+        st.markdown(data["constraints"])
+        if data.get("hint"):
+            st.info(f"提示：{data['hint']}")
+
+        samples = data.get("samples") or []
+        with st.expander("输入输出样例", expanded=True):
+            if not samples:
+                st.caption("本题没有公开样例。")
+            for index, sample in enumerate(samples, start=1):
+                st.markdown(f"**样例 {index}**")
+                sample_in, sample_out = st.columns(2)
+                sample_in.caption("输入")
+                sample_in.code(sample.get("input", ""), language=None)
+                sample_out.caption("输出")
+                sample_out.code(sample.get("output", ""), language=None)
 
 
 def page_problems() -> None:
@@ -396,16 +470,22 @@ def page_problems() -> None:
     if not login:
         return
     st.title("题库与评测")
-    st.caption("浏览题目、在线编写代码、查看判题记录，并在同一工作区维护题目。")
-    browse_tab, judge_tab, create_tab, edit_tab = st.tabs(
-        ["浏览题库", "在线做题与记录", "新增题目", "编辑题目"]
-    )
+    st.caption("在一个连续工作台中阅读题目、编写代码、提交评测并查看历史结果。")
     result = api_call("GET", "/api/problems/", quiet=True)
-    problems = result.get("data") or [] if result.get("code") == 200 else []
+    problems = (result.get("data") or []) if result.get("code") == 200 else []
+    tab_labels = ["题目与提交", "题库概览"]
+    if login["role"] == "admin":
+        tab_labels.extend(["新增题目", "编辑题目"])
+    tabs = st.tabs(tab_labels)
+    judge_tab, browse_tab = tabs[:2]
+
+    with judge_tab:
+        page_submissions(embedded=True)
 
     with browse_tab:
         if not problems:
-            st.info("题库目前为空。可切换到“新增题目”创建第一道题。")
+            empty_hint = "可切换到“新增题目”创建第一道题。" if login["role"] == "admin" else ""
+            st.info(f"题库目前为空。{empty_hint}")
         else:
             with st.spinner("正在整理题目与个人通过状态……"):
                 overviews = load_problem_overviews(problems, login)
@@ -417,6 +497,11 @@ def page_problems() -> None:
                     "难度": overview["detail"].get("difficulty") or "未标注",
                     "标签": "、".join(overview["detail"].get("tags") or []) or "—",
                     "提交次数": overview["attempts"],
+                    "最近结果": (
+                        STATUS_LABELS.get(overview["latest_verdict"], overview["latest_verdict"])
+                        if overview["latest_verdict"]
+                        else "—"
+                    ),
                 }
                 for overview in overviews
             ]
@@ -426,50 +511,14 @@ def page_problems() -> None:
                 hide_index=True,
                 column_config={"提交次数": st.column_config.NumberColumn(format="%d 次")},
             )
-            choices = {
-                f"{overview['state']} · {overview['detail']['id']} · {overview['detail']['title']}": overview
-                for overview in overviews
-            }
-            selected_label = st.selectbox("查看题目详情", list(choices), key="problem_browser")
-            overview = choices[selected_label]
-            data = overview["detail"]
-            problem_id = data["id"]
-
-            with st.container(border=True):
-                st.subheader(f"{problem_id} · {data['title']}")
-                st.caption(
-                    f"难度：{data.get('difficulty') or '未标注'} · "
-                    f"来源：{data.get('source') or '课程题库'} · {overview['state']}"
-                )
-
-                limit1, limit2, limit3, limit4 = st.columns(4)
-                limit1.metric("时间限制", f"{data['time_limit']} s")
-                limit2.metric("内存限制", f"{data['memory_limit']} MB")
-                limit3.metric("测试点", len(data["testcases"]))
-                limit4.metric("个人提交", overview["attempts"])
-                st.markdown(data["description"])
-                info_left, info_right = st.columns(2)
-                with info_left:
-                    st.markdown("**输入格式**")
-                    st.markdown(data["input_description"])
-                with info_right:
-                    st.markdown("**输出格式**")
-                    st.markdown(data["output_description"])
-                st.markdown("**数据范围**")
-                st.markdown(data["constraints"])
-                if data.get("hint"):
-                    st.info(f"提示：{data['hint']}")
-
-                with st.expander("查看样例", expanded=True):
-                    for index, sample in enumerate(data.get("samples") or [], start=1):
-                        st.markdown(f"**样例 {index}**")
-                        sample_in, sample_out = st.columns(2)
-                        sample_in.caption("输入")
-                        sample_in.code(sample.get("input", ""), language=None)
-                        sample_out.caption("输出")
-                        sample_out.code(sample.get("output", ""), language=None)
-
             if login["role"] == "admin":
+                choices = {
+                    f"{overview['detail']['id']} · {overview['detail']['title']}": overview
+                    for overview in overviews
+                }
+                selected_label = st.selectbox("选择管理题目", list(choices), key="problem_browser")
+                data = choices[selected_label]["detail"]
+                problem_id = data["id"]
                 with st.expander("管理员题目操作"):
                     visibility = st.toggle(
                         "向所有登录用户公开测试点日志",
@@ -499,30 +548,30 @@ def page_problems() -> None:
                             set_flash("success", "题目已删除。")
                             st.rerun()
 
-    with judge_tab:
-        page_submissions(embedded=True)
+    if login["role"] == "admin":
+        create_tab, edit_tab = tabs[2:]
+        with create_tab:
+            draft = st.session_state.get("ai_problem_draft")
+            if draft:
+                st.info("已载入 AI 命题草稿。请人工审阅所有字段后再保存。")
+            payload = problem_form("create_problem", draft)
+            if payload:
+                with st.spinner("正在保存题目……"):
+                    created = api_call("POST", "/api/problems/", json=payload)
+                if created.get("code") == 200:
+                    st.session_state.pop("ai_problem_draft", None)
+                    set_flash("success", f"题目 {payload['id']} 已创建。")
+                    st.rerun()
 
-    with create_tab:
-        draft = st.session_state.get("ai_problem_draft")
-        if draft:
-            st.info("已载入 AI 命题草稿。请人工审阅所有字段后再保存。")
-        payload = problem_form("create_problem", draft)
-        if payload:
-            with st.spinner("正在保存题目……"):
-                created = api_call("POST", "/api/problems/", json=payload)
-            if created.get("code") == 200:
-                st.session_state.pop("ai_problem_draft", None)
-                set_flash("success", f"题目 {payload['id']} 已创建。")
-                st.rerun()
-
-    with edit_tab:
-        if not problems:
-            st.info("暂无可编辑题目。")
-        else:
-            ids = [item["id"] for item in problems]
-            selected_id = st.selectbox("选择待编辑题目", ids, key="problem_editor")
-            detail = api_call("GET", f"/api/problems/{selected_id}", quiet=True)
-            if detail.get("code") == 200:
+        with edit_tab:
+            if not problems:
+                st.info("暂无可编辑题目。")
+            else:
+                ids = [item["id"] for item in problems]
+                selected_id = st.selectbox("选择待编辑题目", ids, key="problem_editor")
+                detail = api_call("GET", f"/api/problems/{selected_id}", quiet=True)
+                if detail.get("code") != 200:
+                    return
                 payload = problem_form(f"edit_problem_{selected_id}", detail["data"], lock_id=True)
                 if payload:
                     with st.spinner("正在更新题目……"):
@@ -649,36 +698,36 @@ def page_submissions(*, embedded: bool = False) -> None:
         return
     if not embedded:
         st.title("提交与评测")
-    st.caption("选择题目和语言提交代码；每位用户每分钟最多提交 3 次。")
-    submit_tab, records_tab = st.tabs(["提交代码", "我的提交"])
+    st.caption("题目信息、代码编辑器和提交记录位于同一页面；每位用户每分钟最多提交 3 次。")
     problem_result = api_call("GET", "/api/problems/", quiet=True)
     language_result = api_call("GET", "/api/languages/", quiet=True)
     problems = problem_result.get("data") or []
     languages = (language_result.get("data") or {}).get("name", [])
 
-    with submit_tab:
-        if not problems:
-            st.info("题库为空，暂时无法提交。")
-        elif not languages:
-            st.warning("尚未配置可用语言，请联系管理员。")
+    if not problems:
+        st.info("题库为空，暂时无法提交。")
+    elif not languages:
+        st.warning("尚未配置可用语言，请联系管理员。")
+    else:
+        problem_map = {f"{item['id']} · {item['title']}": item["id"] for item in problems}
+        labels = list(problem_map)
+        preferred = st.session_state.pop("submit_problem_id", None)
+        selected_index = next(
+            (index for index, label in enumerate(labels) if problem_map[label] == preferred), 0
+        )
+        problem_label = st.selectbox("选择题目 *", labels, index=selected_index)
+        selected_problem_id = problem_map[problem_label]
+        selected_detail = api_call("GET", f"/api/problems/{selected_problem_id}", quiet=True)
+        if selected_detail.get("code") == 200:
+            render_problem_statement(selected_detail["data"])
         else:
-            problem_map = {f"{item['id']} · {item['title']}": item["id"] for item in problems}
-            labels = list(problem_map)
-            preferred = st.session_state.pop("submit_problem_id", None)
-            selected_index = next(
-                (index for index, label in enumerate(labels) if problem_map[label] == preferred), 0
-            )
-            problem_label = st.selectbox("题目 *", labels, index=selected_index)
-            selected_problem_id = problem_map[problem_label]
-            selected_detail = api_call("GET", f"/api/problems/{selected_problem_id}", quiet=True)
-            if selected_detail.get("code") == 200:
-                detail = selected_detail["data"]
-                limit1, limit2, limit3 = st.columns(3)
-                limit1.metric("时间限制", f"{detail['time_limit']} s")
-                limit2.metric("内存限制", f"{detail['memory_limit']} MB")
-                limit3.metric("测试点", len(detail["testcases"]))
-            language = st.selectbox("语言 *", languages, key="judge_language")
-            st.caption("编辑器支持行号、Tab 缩进、括号补全、语法高亮、查找替换和 VS Code 快捷键。")
+            st.error(selected_detail.get("msg", "题目信息加载失败"))
+
+        with st.container(border=True):
+            editor_title, editor_language = st.columns([3, 1])
+            editor_title.markdown("### 提交代码")
+            language = editor_language.selectbox("语言 *", languages, key="judge_language")
+            st.caption("支持行号、Tab 缩进、括号补全、语法高亮、查找替换和 VS Code 快捷键。")
             editor_response = code_editor(
                 _starter_code(language),
                 lang=_editor_language(language),
@@ -737,69 +786,78 @@ def page_submissions(*, embedded: bool = False) -> None:
                     if result.get("code") == 200:
                         st.session_state.last_submission_id = result["data"]["submission_id"]
                         st.success(f"提交成功：#{result['data']['submission_id']}")
-        live_submission_panel()
+            live_submission_panel()
 
-    with records_tab:
-        filter_col, status_col, refresh_col = st.columns([2, 2, 1])
-        filter_problem = filter_col.selectbox(
-            "题目筛选",
-            [""] + [item["id"] for item in problems],
-            format_func=lambda x: x or "全部题目",
-        )
-        filter_status = status_col.selectbox(
-            "任务状态",
-            ["", "pending", "success", "error"],
-            format_func=lambda x: {
-                "": "全部状态",
-                "pending": "评测中",
-                "success": "已完成",
-                "error": "异常",
-            }[x],
-        )
-        refresh_col.write("")
-        refresh_col.write("")
-        refresh_col.button("刷新", width="stretch")
-        params = {"user_id": login["user_id"], "page_size": 100}
-        if filter_problem:
-            params["problem_id"] = filter_problem
-        if filter_status:
-            params["status"] = filter_status
-        with st.spinner("正在读取提交记录……"):
-            records = api_call("GET", "/api/submissions/", params=params, quiet=True)
-        if records.get("code") == 200:
-            submissions = records["data"]["submissions"]
-            if not submissions:
-                st.info("当前筛选条件下没有提交记录。")
-            else:
-                rows = [
-                    {
-                        "提交号": record["submission_id"],
-                        "题目": record.get("problem_id", "—"),
-                        "语言": record.get("language", "—"),
-                        "结果": submission_verdict(record),
-                        "得分": (
-                            "—"
-                            if record["status"] == "pending"
-                            else f"{record.get('score', 0)} / {record.get('counts', 0)}"
-                        ),
-                        "任务状态": record["status"],
-                    }
-                    for record in submissions
-                ]
-                st.dataframe(rows, width="stretch", hide_index=True)
-                record_options = {
-                    (
-                        f"#{record['submission_id']} · {record.get('problem_id', '—')} · "
-                        f"{record.get('language', '—')} · {submission_verdict(record)}"
-                    ): record["submission_id"]
-                    for record in submissions
-                }
-                selected_record = st.selectbox(
-                    "查看提交详情",
-                    list(record_options),
-                    key="submission_record_selector",
-                )
-                render_submission_detail(record_options[selected_record], login)
+    st.divider()
+    st.subheader("提交记录")
+    st.caption("不同判题结果使用独立标签和颜色；点击“详情”可查看源代码与每个测试点。")
+    filter_col, status_col, refresh_col = st.columns([2, 2, 1])
+    filter_problem = filter_col.selectbox(
+        "题目筛选",
+        [""] + [item["id"] for item in problems],
+        format_func=lambda x: x or "全部题目",
+        key="submission_problem_filter",
+    )
+    verdict_options = ["", "AC", "WA", "TLE", "MLE", "RE", "CE", "UNK", "pending", "error"]
+    filter_verdict = status_col.selectbox(
+        "判题结果",
+        verdict_options,
+        format_func=lambda value: "全部结果" if not value else STATUS_LABELS.get(value, value),
+        key="submission_verdict_filter",
+    )
+    refresh_col.write("")
+    refresh_col.write("")
+    refresh_col.button("刷新记录", width="stretch")
+    params = {"user_id": login["user_id"], "page_size": 100}
+    if filter_problem:
+        params["problem_id"] = filter_problem
+    with st.spinner("正在读取提交记录……"):
+        records = api_call("GET", "/api/submissions/", params=params, quiet=True)
+    if records.get("code") != 200:
+        if records.get("code") != 401:
+            st.error(records.get("msg", "提交记录加载失败"))
+        return
+
+    submissions = records["data"]["submissions"]
+    if filter_verdict:
+        submissions = [
+            record for record in submissions if submission_verdict(record) == filter_verdict
+        ]
+    if not submissions:
+        st.info("当前筛选条件下没有提交记录。")
+        return
+
+    record_ids = [record["submission_id"] for record in submissions]
+    if st.session_state.get("selected_submission_id") not in record_ids:
+        st.session_state.selected_submission_id = record_ids[0]
+    for record in submissions:
+        verdict = submission_verdict(record)
+        with st.container(border=True):
+            identity, result_column, score_column, time_column, action_column = st.columns(
+                [2.2, 2, 1, 2, 0.8]
+            )
+            identity.markdown(f"**#{record['submission_id']} · {record.get('problem_id', '—')}**")
+            identity.caption(f"语言：{record.get('language', '—')}")
+            result_column.caption("判题结果")
+            result_column.markdown(status_badge(verdict), unsafe_allow_html=True)
+            score_column.caption("得分")
+            score_column.write(
+                "—"
+                if record["status"] == "pending"
+                else f"{record.get('score', 0)} / {record.get('counts', 0)}"
+            )
+            time_column.caption("提交时间")
+            time_column.write(str(record.get("created_at", "—")).replace("T", " ")[:19])
+            action_column.write("")
+            if action_column.button(
+                "详情",
+                key=f"view_submission_{record['submission_id']}",
+                width="stretch",
+            ):
+                st.session_state.selected_submission_id = record["submission_id"]
+
+    st.markdown("### 提交详情")
+    render_submission_detail(st.session_state.selected_submission_id, login)
 
 
 @st.fragment(run_every=1.0)
