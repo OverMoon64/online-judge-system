@@ -514,24 +514,24 @@ def build(output: Path, test_summary: str) -> None:
         PageBreak(),
         p("6　Streamlit 前端", s["h1"]),
         p(
-            "前端围绕真实验收流程组织：账户、题目、提交、AI 命题和系统管理。独立 HTTP Session 保存签名 Cookie，所有操作均调用 REST API；按钮显隐只改善体验，权限最终仍由后端判断。",
+            "前端围绕真实验收流程组织：账户中心、题目中心、提交评测、AI 命题和后台管理。原生 httpx.Client 保存在 Streamlit session_state 中，登录后的签名 Cookie 可跨 rerun 复用；所有操作均调用 REST API，权限最终仍由后端判断。",
             s["body"],
         ),
         p("页面覆盖", s["h2"]),
         table(
             [
                 ["页面组", "核心交互"],
-                ["账户", "注册、登录、退出、资料、用户列表与角色管理"],
-                ["题目", "列表、详情、新增、编辑、删除、日志可见性"],
-                ["提交", "代码编辑、语言选择、筛选分页、详情、日志、重测"],
+                ["账户中心", "注册、登录、退出、资料；侧边栏显示用户与角色"],
+                ["题目中心", "难度/通过状态、详情、增改删与日志可见性"],
+                ["提交评测", "代码编辑、状态颜色、筛选、详情、日志与重测"],
                 ["AI 命题", "模型配置、任务进度、取消、费用、载入编辑器"],
-                ["系统", "语言配置、访问审计、数据重置"],
+                ["后台管理", "用户角色、语言配置、访问审计、数据重置"],
             ],
             [35 * mm, 125 * mm],
         ),
         p("异步反馈", s["h2"]),
         p(
-            "提交详情使用局部刷新显示 pending/running 到最终状态，不阻塞其它页面；所有 API 错误统一展示 HTTP 状态、code 与 msg。AI 页面同样展示阶段进度、取消状态和费用统计。",
+            "提交详情使用局部刷新显示 pending/running 到最终状态；所有 API 错误统一展示 HTTP 状态、code 与 msg。后端未启动、登录失效、空数据和窄屏均有明确反馈；退出会调用后端 logout 并清理本地 Cookie。",
             s["body"],
         ),
     ]
@@ -540,8 +540,8 @@ def build(output: Path, test_summary: str) -> None:
     if screenshot.exists():
         story += [
             p("真实界面截图", s["h2"]),
-            Image(str(screenshot), width=160 * mm, height=90 * mm),
-            p("图：Streamlit 在线评测系统主界面（本地运行）", s["small"]),
+            Image(str(screenshot), width=144 * mm, height=100 * mm),
+            p("图：登录后保持 Session 的管理员后台管理界面", s["small"]),
         ]
 
     story += [
@@ -557,7 +557,7 @@ def build(output: Path, test_summary: str) -> None:
             [
                 ["测试域", "代表场景"],
                 ["契约", "字段校验、统一响应、422→400、错误优先级"],
-                ["认证", "注册、登录、Session、角色变化、封禁"],
+                ["认证", "登录 Cookie 跨 rerun、退出清理、角色变化、封禁"],
                 ["判题", "Python/C++：AC、WA、RE、CE、TLE、MLE、空白比较"],
                 ["数据", "分页筛选、限流、去重统计、同 ID 重测、重置"],
                 ["审计", "公开/隐藏日志与成功/拒绝访问记录矩阵"],

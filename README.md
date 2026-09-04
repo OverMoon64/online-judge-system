@@ -55,6 +55,18 @@ VS Code 已提供推荐扩展、Python 解释器、调试和任务配置。以 R
 - API 文档：<http://127.0.0.1:8000/docs>
 - 初始管理员：`admin / admintestpassword`
 
+## 前端会话与界面
+
+Streamlit 把同一个 `httpx.Client` 保存在 `st.session_state` 中，登录响应写入的签名
+Session Cookie 会在 rerun 后继续用于资料、用户、题目、提交、日志、AI 和管理接口。
+退出时前端先调用后端 logout，再清理本地 Cookie 与登录状态；若后端返回 401，页面会提示
+登录已失效并回到账户入口，不会依赖前端角色状态绕过认证。
+
+前后端通信统一使用 `OJ_API_BASE_URL`（默认 `http://127.0.0.1:8000`），不要在同一次
+运行中混用 `localhost` 与 `127.0.0.1`。登录后的侧边栏显示用户名和角色，并按角色精简
+导航；题目通过状态、判题结果颜色和管理员功能分组均用于改善现场验收体验，最终权限仍由
+后端 REST API 判断。
+
 生成演示数据：
 
 ```bash
@@ -95,8 +107,8 @@ API Key 仅保存在后端进程内存中，重启或系统重置后清除，查
 ```
 
 测试包含真实 Python/C++ 子进程以及 AC、WA、RE、CE、TLE、MLE、权限矩阵、错误优先级、
-审计、重置、AI 用量和实际取消。GitHub Actions 会在 Ubuntu/Python 3.10 上执行相同检查，
-并要求后端覆盖率不低于 85%。
+审计、重置、AI 用量、实际取消和前端 Cookie 跨 rerun/退出回归。GitHub Actions 会在
+Ubuntu/Python 3.10 上执行相同检查，并要求后端覆盖率不低于 85%。
 
 ## Git 提交规范
 
@@ -111,4 +123,3 @@ git config core.hooksPath .githooks
 
 验收演示顺序见 [`docs/demo-checklist.md`](docs/demo-checklist.md)，实验报告源文件见
 [`docs/report.md`](docs/report.md)。
-
