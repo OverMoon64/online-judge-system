@@ -205,6 +205,24 @@ def resource_limit_summary(validation: dict[str, Any]) -> str | None:
     return f"{summary} · {reasons}" if reasons else summary
 
 
+def complexity_validation_summary(validation: dict[str, Any]) -> str | None:
+    complexity = validation.get("complexity_validation") or {}
+    if not complexity.get("passed"):
+        return None
+    stress_count = len(complexity.get("stress_testcase_indexes") or [])
+    rejected = int(complexity.get("rejected_stress_cases", 0) or 0)
+    return (
+        f"复杂度压力验证通过：本地生成 {stress_count} 个大规模隐藏点，"
+        f"低效但正确的探针解在 {rejected} 个压力点被 TLE/MLE 淘汰。"
+    )
+
+
+def compact_preview(value: str, limit: int = 2_000) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"\n…（共 {len(value)} 字符，页面仅显示前 {limit} 字符）"
+
+
 def resolve_problem_selection(
     problem_ids: list[str], current: str | None, requested: str | None = None
 ) -> str | None:
@@ -1024,6 +1042,53 @@ def live_ai_task_panel() -> None:
         resource_summary = resource_limit_summary(validation)
         if resource_summary:
             st.caption(resource_summary)
+        id_assignment = validation.get("id_assignment") or {}
+        if id_assignment.get("source") == "automatic":
+            st.caption(
+                f"系统顺序编号：{id_assignment.get('final_id', '—')}"
+                f"（模型原编号：{id_assignment.get('model_id', '—')}）"
+            )
+        complexity_summary = complexity_validation_summary(validation)
+        if complexity_summary:
+            st.success(complexity_summary)
+            complexity = validation.get("complexity_validation") or {}
+            contract = result.get("complexity_contract") or {}
+            with st.expander("查看复杂度压力验证明细"):
+                st.markdown(
+                    f"**目标复杂度：** {contract.get('expected_time_complexity') or '—'}；"
+                    f"**空间复杂度：** {contract.get('expected_space_complexity') or '—'}"
+                )
+                st.caption(
+                    "需要淘汰："
+                    + "、".join(contract.get("forbidden_time_complexities") or ["未填写"])
+                )
+                st.write(contract.get("stress_rationale") or "未填写压力规模依据。")
+                stress_rows = [
+                    {
+                        "压力点": item.get("label", "—"),
+                        "规模": item.get("scale", "—"),
+                        "输入字节": item.get("input_bytes", 0),
+                    }
+                    for item in complexity.get("items") or []
+                ]
+                if stress_rows:
+                    st.dataframe(stress_rows, hide_index=True, width="stretch")
+                probe_rows = [
+                    {
+                        "类型": {
+                            "sample": "小样例",
+                            "ordinary": "普通点",
+                            "stress": "压力点",
+                        }.get(item.get("kind"), "—"),
+                        "序号": item.get("index", "—"),
+                        "结果": item.get("status", "—"),
+                        "时间(s)": item.get("time", 0),
+                        "内存(MB)": item.get("memory", 0),
+                    }
+                    for item in complexity.get("probe_results") or []
+                ]
+                if probe_rows:
+                    st.dataframe(probe_rows, hide_index=True, width="stretch")
         calibration = validation.get("output_calibration") or {}
         if calibration.get("applied"):
             calibration_count = int(calibration.get("count", 0) or 0)
@@ -1070,9 +1135,9 @@ def live_ai_task_panel() -> None:
                 for index, case in enumerate(problem.get("testcases") or [], start=1):
                     left, right = st.columns(2)
                     left.caption(f"测试点 {index} · 输入")
-                    left.code(case.get("input", ""), language=None)
+                    left.code(compact_preview(case.get("input", "")), language=None)
                     right.caption(f"测试点 {index} · 输出")
-                    right.code(case.get("output", ""), language=None)
+                    right.code(compact_preview(case.get("output", "")), language=None)
         if st.button("载入到题目新增表单", key=f"load_{task_id}"):
             draft = dict(result["problem"])
             draft["author"] = usage.get("model") or "AI 模型"
