@@ -114,8 +114,7 @@ def fibonacci_payload() -> dict:
             "id": "FIB_MOD",
             "title": "斐波那契数列取模",
             "description": (
-                "定义 F(0)=0、F(1)=1，且 F(n)=F(n-1)+F(n-2)。"
-                "求 F(N) 对 1000000007 取模的结果。"
+                "定义 F(0)=0、F(1)=1，且 F(n)=F(n-1)+F(n-2)。求 F(N) 对 1000000007 取模的结果。"
             ),
             "input_description": "输入一个非负整数 N。",
             "output_description": "输出 F(N) mod 1000000007。",
@@ -261,8 +260,10 @@ async def test_ai_calibrates_fibonacci_outputs_with_two_model_calls(
     async def fake_provider(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        content = "递推与取模边界分析" if calls == 1 else json.dumps(
-            fibonacci_payload(), ensure_ascii=False
+        content = (
+            "递推与取模边界分析"
+            if calls == 1
+            else json.dumps(fibonacci_payload(), ensure_ascii=False)
         )
         return content, {"input_tokens": 10, "output_tokens": 20}
 
@@ -271,8 +272,7 @@ async def test_ai_calibrates_fibonacci_outputs_with_two_model_calls(
         "/api/ai/problem-tasks/",
         json={
             "requirement": (
-                "求斐波那契数列的第 N 项，结果对 1000000007 取模，"
-                "适合练习递推与取模。"
+                "求斐波那契数列的第 N 项，结果对 1000000007 取模，适合练习递推与取模。"
             ),
             "knowledge_points": ["递推", "取模"],
             "testcase_count": 3,
@@ -312,8 +312,7 @@ async def test_ai_refuses_consensus_without_anchor_and_reports_disagreement() ->
 
     disagreement_data = fibonacci_payload()
     disagreement_data["reference_solution_cpp"] = (
-        "#include <iostream>\nusing namespace std;\n"
-        "int main(){long long n;cin>>n;cout<<n+42;}\n"
+        "#include <iostream>\nusing namespace std;\nint main(){long long n;cin>>n;cout<<n+42;}\n"
     )
     for case in [
         *disagreement_data["problem"]["samples"],
@@ -347,10 +346,7 @@ async def test_ai_does_not_calibrate_when_one_reference_cannot_run(
             expected = [
                 case.output for case in [*generated.problem.samples, *generated.problem.testcases]
             ]
-            results = [
-                judge.ProcessResult("OK", 0, output, "", 0.01, 1.0)
-                for output in expected
-            ]
+            results = [judge.ProcessResult("OK", 0, output, "", 0.01, 1.0) for output in expected]
         return judge.ReferenceExecution(language, None, results)
 
     monkeypatch.setattr(ai_service, "execute_reference_solution", fake_execution)
