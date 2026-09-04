@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+data/
+logs/
+artifacts/
+tmp/
+*.db
+*.sqlite3
+.streamlit/secrets.toml
+.DS_Store
+.idea/
