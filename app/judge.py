@@ -35,6 +35,13 @@ class ProcessResult:
     peak_memory_mb: float
 
 
+@dataclass(slots=True)
+class ReferenceExecution:
+    language: str
+    setup_error: str | None
+    results: list[ProcessResult]
+
+
 class OutputLimitExceeded(Exception):
     pass
 
@@ -392,10 +399,33 @@ async def wait_for_submission(submission_id: int, timeout: float = 10.0) -> None
 async def validate_reference_solution(
     problem: ProblemPayload, reference_solution: str, language: str = "python"
 ) -> list[str]:
+    execution = await execute_reference_solution(problem, reference_solution, language)
+    if execution.setup_error:
+        return [execution.setup_error]
     errors: list[str] = []
+    for index, (testcase, result) in enumerate(
+        zip(problem.testcases, execution.results, strict=True), start=1
+    ):
+        if result.status != "OK":
+            errors.append(f"testcase {index}: {result.status}")
+        elif normalize_output(result.stdout) != normalize_output(testcase.output):
+            errors.append(f"testcase {index}: reference solution output mismatch")
+    return errors
+
+
+async def execute_reference_solution(
+    problem: ProblemPayload,
+    reference_solution: str,
+    language: str = "python",
+    *,
+    inputs: list[str] | None = None,
+) -> ReferenceExecution:
+    """Compile once and execute a reference solution for every supplied input."""
+
+    if language not in {"python", "cpp"}:
+        raise ValueError("reference solution language must be python or cpp")
+    case_inputs = inputs if inputs is not None else [case.input for case in problem.testcases]
     with tempfile.TemporaryDirectory(prefix="oj-ai-validation-") as temp_name:
-        if language not in {"python", "cpp"}:
-            raise ValueError("reference solution language must be python or cpp")
         source = Path(temp_name) / ("solution.cpp" if language == "cpp" else "solution.py")
         executable = Path(temp_name) / "solution"
         await asyncio.to_thread(source.write_text, reference_solution, encoding="utf-8")
@@ -407,28 +437,30 @@ async def validate_reference_solution(
                 max(problem.memory_limit, 256),
             )
             if compile_result.status != "OK":
-                return [
+                return ReferenceExecution(
+                    language,
                     "compile: "
                     + _sanitize_message(
                         compile_result.stderr or compile_result.status,
                         temp_name,
-                    )
-                ]
+                    ),
+                    [],
+                )
             run_command = [str(executable)]
         else:
             run_command = ["python3", str(source)]
-        for index, testcase in enumerate(problem.testcases, start=1):
+
+        results: list[ProcessResult] = []
+        for input_text in case_inputs:
             result = await run_process(
                 run_command,
-                testcase.input,
+                input_text,
                 problem.time_limit,
                 problem.memory_limit,
             )
-            if result.status != "OK":
-                errors.append(f"testcase {index}: {result.status}")
-            elif normalize_output(result.stdout) != normalize_output(testcase.output):
-                errors.append(f"testcase {index}: reference solution output mismatch")
-    return errors
+            result.stderr = _sanitize_message(result.stderr, temp_name)
+            results.append(result)
+        return ReferenceExecution(language, None, results)
 
 
 async def submission_exists(submission_id: int) -> bool:

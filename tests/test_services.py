@@ -85,6 +85,17 @@ async def test_process_runner_unknown_runtime_output_limit_and_reference_validat
     assert flooded.status == "RE"
 
     problem = _problem()
+    python_execution = await judge.execute_reference_solution(
+        problem,
+        "print(input().strip())",
+        inputs=[case.input for case in [*problem.samples, *problem.testcases]],
+    )
+    assert python_execution.setup_error is None
+    assert [result.status for result in python_execution.results] == ["OK", "OK"]
+    assert [judge.normalize_output(result.stdout) for result in python_execution.results] == [
+        "1",
+        "2",
+    ]
     assert await judge.validate_reference_solution(problem, "print(input().strip())") == []
     mismatch = await judge.validate_reference_solution(problem, "print(999)")
     assert mismatch == ["testcase 1: reference solution output mismatch"]
@@ -95,6 +106,17 @@ async def test_process_runner_unknown_runtime_output_limit_and_reference_validat
         "int main(){string value;getline(cin,value);cout<<value;}\n"
     )
     assert await judge.validate_reference_solution(problem, cpp_solution, language="cpp") == []
+    cpp_execution = await judge.execute_reference_solution(
+        problem,
+        cpp_solution,
+        language="cpp",
+        inputs=["7\n", "8\n"],
+    )
+    assert cpp_execution.setup_error is None
+    assert [judge.normalize_output(result.stdout) for result in cpp_execution.results] == [
+        "7",
+        "8",
+    ]
     cpp_compile_error = await judge.validate_reference_solution(
         problem, "int main( {", language="cpp"
     )
