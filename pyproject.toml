@@ -1,0 +1,28 @@
+[project]
+name = "online-judge-system"
+version = "1.0.0"
+description = "Async FastAPI online judge for the Programming Practice course"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "integration: runs real compiler or subprocess integration tests",
+]
+
+[tool.coverage.run]
+concurrency = ["greenlet", "thread"]
+source = ["app"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+ignore = ["B008", "E501"]
