@@ -824,6 +824,12 @@ def live_ai_task_panel() -> None:
     if usage.get("estimated"):
         st.caption("模型未返回完整 usage，当前 Token 与费用无法精确统计。")
     if data["status"] in {"pending", "running"}:
+        stream_result = data.get("result") or {}
+        stream_preview = stream_result.get("stream_preview", "")
+        if stream_preview:
+            stage = stream_result.get("stream_stage", "模型输出")
+            with st.expander(f"实时输出 · {stage}", expanded=True):
+                st.code(stream_preview, language=None, wrap_lines=True)
         if st.button("中断任务", key=f"cancel_{task_id}"):
             cancelled = api_call("PUT", f"/api/ai/problem-tasks/{task_id}/cancel")
             if cancelled.get("code") == 200:
@@ -842,7 +848,19 @@ def live_ai_task_panel() -> None:
             )
             st.markdown(problem.get("description", ""))
             with st.expander("查看参考解法与复杂度"):
-                st.code(result.get("reference_solution", ""), language="python", line_numbers=True)
+                python_tab, cpp_tab = st.tabs(["Python 3", "C++14"])
+                with python_tab:
+                    st.code(
+                        result.get("reference_solution", ""),
+                        language="python",
+                        line_numbers=True,
+                    )
+                with cpp_tab:
+                    st.code(
+                        result.get("reference_solution_cpp", ""),
+                        language="cpp",
+                        line_numbers=True,
+                    )
                 st.markdown(result.get("solution_explanation", ""))
             with st.expander("查看生成的测试点"):
                 for index, case in enumerate(problem.get("testcases") or [], start=1):
@@ -903,7 +921,11 @@ def page_ai() -> None:
             knowledge_text = st.text_input("知识点（逗号分隔）")
             left, right = st.columns(2)
             difficulty = left.selectbox("预期难度", ["入门", "简单", "中等", "困难"])
-            testcase_count = right.slider("测试点数量", 2, 10, 6)
+            testcase_choice = right.selectbox(
+                "隐藏测试点策略",
+                ["自动"] + list(range(2, 11)),
+                help="自动模式由模型结合算法复杂度、边界规模和预计运行时长生成 2–10 个测试点。",
+            )
             problem_id = st.selectbox("参考/修改已有题目（可选）", [""] + existing_ids)
             submitted = st.form_submit_button(
                 "开始智能命题", type="primary", width="stretch", disabled=not model_names
@@ -923,7 +945,7 @@ def page_ai() -> None:
                             item.strip() for item in knowledge_text.split(",") if item.strip()
                         ],
                         "difficulty": difficulty,
-                        "testcase_count": testcase_count,
+                        "testcase_count": (None if testcase_choice == "自动" else testcase_choice),
                     },
                 )
                 if result.get("code") == 200:
