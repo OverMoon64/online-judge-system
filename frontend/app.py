@@ -101,10 +101,16 @@ def clear_local_session(*, close_client: bool = False) -> None:
         "submission_log",
         "ai_task_id",
         "ai_problem_draft",
+        "selected_submission_id",
+        "problem_section",
+        "next_problem_section",
         "main_navigation",
         "next_navigation",
     ):
         st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if str(key).startswith(("judge_code_", "judge_editor_", "submit_code_")):
+            st.session_state.pop(key, None)
     if close_client:
         close_persistent_client(st.session_state)
     else:
@@ -278,6 +284,33 @@ def page_account() -> None:
         left.markdown(f"**加入日期**  \n{data['join_time']}")
         right.markdown(f"**角色**  \n{role_label(data['role'])}")
         right.markdown(f"**用户 ID**  \n{data['user_id']}")
+
+    with st.expander("修改登录密码"):
+        st.caption("修改后当前登录保持有效；下次登录请使用新密码。")
+        with st.form("change_password_form", clear_on_submit=True):
+            current_password = st.text_input("当前密码 *", type="password")
+            new_password = st.text_input("新密码 *", type="password", help="至少 6 位，最长 256 位")
+            confirmed_password = st.text_input("确认新密码 *", type="password")
+            change_submitted = st.form_submit_button("保存新密码", type="primary")
+        if change_submitted:
+            if not current_password or len(new_password) < 6:
+                st.error("请填写当前密码，且新密码不能少于 6 位。")
+            elif new_password != confirmed_password:
+                st.error("两次输入的新密码不一致。")
+            elif current_password == new_password:
+                st.error("新密码不能与当前密码相同。")
+            else:
+                with st.spinner("正在安全更新密码……"):
+                    changed = api_call(
+                        "PUT",
+                        f"/api/users/{login['user_id']}/password",
+                        json={
+                            "current_password": current_password,
+                            "new_password": new_password,
+                        },
+                    )
+                if changed.get("code") == 200:
+                    st.success("密码已更新。")
 
 
 def problem_form(
@@ -470,22 +503,28 @@ def page_problems() -> None:
     if not login:
         return
     st.title("题库与评测")
-    st.caption("在一个连续工作台中阅读题目、编写代码、提交评测并查看历史结果。")
+    st.caption("题目信息与代码提交位于同一工作台；提交历史和详情在顶部“提交记录”中查看。")
     result = api_call("GET", "/api/problems/", quiet=True)
     problems = (result.get("data") or []) if result.get("code") == 200 else []
-    tab_labels = ["题目与提交", "题库概览"]
-    if login["role"] == "admin":
-        tab_labels.extend(["新增题目", "编辑题目"])
-    tabs = st.tabs(tab_labels)
-    judge_tab, browse_tab = tabs[:2]
+    pending_section = st.session_state.pop("next_problem_section", None)
+    if pending_section:
+        st.session_state.problem_section = pending_section
+    section = st.segmented_control(
+        "题库功能",
+        ["题目与提交", "题库概览", "新增题目", "编辑题目"],
+        default="题目与提交",
+        key="problem_section",
+        selection_mode="single",
+        required=True,
+        width="stretch",
+        label_visibility="collapsed",
+    )
 
-    with judge_tab:
-        page_submissions(embedded=True)
-
-    with browse_tab:
+    if section == "题目与提交":
+        render_problem_workspace()
+    elif section == "题库概览":
         if not problems:
-            empty_hint = "可切换到“新增题目”创建第一道题。" if login["role"] == "admin" else ""
-            st.info(f"题库目前为空。{empty_hint}")
+            st.info("题库目前为空，可切换到“新增题目”创建第一道题。")
         else:
             with st.spinner("正在整理题目与个人通过状态……"):
                 overviews = load_problem_overviews(problems, login)
@@ -548,37 +587,35 @@ def page_problems() -> None:
                             set_flash("success", "题目已删除。")
                             st.rerun()
 
-    if login["role"] == "admin":
-        create_tab, edit_tab = tabs[2:]
-        with create_tab:
-            draft = st.session_state.get("ai_problem_draft")
-            if draft:
-                st.info("已载入 AI 命题草稿。请人工审阅所有字段后再保存。")
-            payload = problem_form("create_problem", draft)
+    elif section == "新增题目":
+        draft = st.session_state.get("ai_problem_draft")
+        if draft:
+            st.info("已载入 AI 命题草稿。请人工审阅所有字段后再保存。")
+        payload = problem_form("create_problem", draft)
+        if payload:
+            with st.spinner("正在保存题目……"):
+                created = api_call("POST", "/api/problems/", json=payload)
+            if created.get("code") == 200:
+                st.session_state.pop("ai_problem_draft", None)
+                st.session_state.next_problem_section = "题库概览"
+                set_flash("success", f"题目 {payload['id']} 已创建。")
+                st.rerun()
+    elif section == "编辑题目":
+        if not problems:
+            st.info("暂无可编辑题目。")
+        else:
+            ids = [item["id"] for item in problems]
+            selected_id = st.selectbox("选择待编辑题目", ids, key="problem_editor")
+            detail = api_call("GET", f"/api/problems/{selected_id}", quiet=True)
+            if detail.get("code") != 200:
+                return
+            payload = problem_form(f"edit_problem_{selected_id}", detail["data"], lock_id=True)
             if payload:
-                with st.spinner("正在保存题目……"):
-                    created = api_call("POST", "/api/problems/", json=payload)
-                if created.get("code") == 200:
-                    st.session_state.pop("ai_problem_draft", None)
-                    set_flash("success", f"题目 {payload['id']} 已创建。")
+                with st.spinner("正在更新题目……"):
+                    updated = api_call("PUT", f"/api/problems/{selected_id}", json=payload)
+                if updated.get("code") == 200:
+                    set_flash("success", f"题目 {selected_id} 已更新。")
                     st.rerun()
-
-        with edit_tab:
-            if not problems:
-                st.info("暂无可编辑题目。")
-            else:
-                ids = [item["id"] for item in problems]
-                selected_id = st.selectbox("选择待编辑题目", ids, key="problem_editor")
-                detail = api_call("GET", f"/api/problems/{selected_id}", quiet=True)
-                if detail.get("code") != 200:
-                    return
-                payload = problem_form(f"edit_problem_{selected_id}", detail["data"], lock_id=True)
-                if payload:
-                    with st.spinner("正在更新题目……"):
-                        updated = api_call("PUT", f"/api/problems/{selected_id}", json=payload)
-                    if updated.get("code") == 200:
-                        set_flash("success", f"题目 {selected_id} 已更新。")
-                        st.rerun()
 
 
 @st.fragment(run_every=1.0)
@@ -692,13 +729,11 @@ def render_submission_detail(submission_id: str, login: dict[str, Any]) -> None:
                 st.error(log_result.get("msg", "测试点日志加载失败"))
 
 
-def page_submissions(*, embedded: bool = False) -> None:
+def render_problem_workspace() -> None:
     login = require_login()
     if not login:
         return
-    if not embedded:
-        st.title("提交与评测")
-    st.caption("题目信息、代码编辑器和提交记录位于同一页面；每位用户每分钟最多提交 3 次。")
+    st.caption("选择题目后可在题面下方直接编写和提交代码；每位用户每分钟最多提交 3 次。")
     problem_result = api_call("GET", "/api/problems/", quiet=True)
     language_result = api_call("GET", "/api/languages/", quiet=True)
     problems = problem_result.get("data") or []
@@ -736,17 +771,8 @@ def page_submissions(*, embedded: bool = False) -> None:
                 height=30,
                 focus=True,
                 allow_reset=True,
-                buttons=[
-                    {
-                        "name": "提交评测",
-                        "feather": "Play",
-                        "primary": True,
-                        "hasText": True,
-                        "showWithIcon": True,
-                        "commands": ["submit"],
-                        "style": {"bottom": "0.44rem", "right": "0.4rem"},
-                    }
-                ],
+                buttons=[],
+                response_mode=["debounce", "blur"],
                 options={
                     "showLineNumbers": True,
                     "tabSize": 4,
@@ -762,14 +788,27 @@ def page_submissions(*, embedded: bool = False) -> None:
                 key=f"judge_editor_{selected_problem_id}_{language}",
             )
             response_id = editor_response.get("id")
-            submitted = (
+            shortcut_submitted = (
                 editor_response.get("type") == "submit"
                 and response_id
                 and response_id != st.session_state.get("last_editor_submit_id")
             )
+            code_state_key = f"judge_code_{selected_problem_id}_{language}"
+            if editor_response.get("text") is not None:
+                st.session_state[code_state_key] = editor_response.get("text", "")
+            button_col, hint_col = st.columns([1, 4], vertical_alignment="center")
+            button_submitted = button_col.button(
+                "提交评测",
+                type="primary",
+                width="stretch",
+                key=f"submit_code_{selected_problem_id}_{language}",
+            )
+            hint_col.caption("提交后可前往顶部“提交记录”查看源代码与逐测试点结果。")
+            submitted = bool(shortcut_submitted or button_submitted)
             if submitted:
-                st.session_state.last_editor_submit_id = response_id
-                code = editor_response.get("text", "")
+                if shortcut_submitted:
+                    st.session_state.last_editor_submit_id = response_id
+                code = st.session_state.get(code_state_key, editor_response.get("text", ""))
                 if not code.strip():
                     st.error("源代码不能为空。")
                 else:
@@ -788,8 +827,18 @@ def page_submissions(*, embedded: bool = False) -> None:
                         st.success(f"提交成功：#{result['data']['submission_id']}")
             live_submission_panel()
 
+
+def page_submission_records() -> None:
+    login = require_login()
+    if not login:
+        return
+    st.title("提交记录")
+    st.caption("筛选历史提交并查看源代码、得分及逐测试点结果。")
+    problem_result = api_call("GET", "/api/problems/", quiet=True)
+    problems = problem_result.get("data") or []
+
     st.divider()
-    st.subheader("提交记录")
+    st.subheader("历史提交")
     st.caption("不同判题结果使用独立标签和颜色；点击“详情”可查看源代码与每个测试点。")
     filter_col, status_col, refresh_col = st.columns([2, 2, 1])
     filter_problem = filter_col.selectbox(
@@ -928,9 +977,12 @@ def live_ai_task_panel() -> None:
                     right.caption(f"测试点 {index} · 输出")
                     right.code(case.get("output", ""), language=None)
         if st.button("载入到题目新增表单", key=f"load_{task_id}"):
-            st.session_state.ai_problem_draft = result["problem"]
+            draft = dict(result["problem"])
+            draft["author"] = usage.get("model") or "AI 模型"
+            st.session_state.ai_problem_draft = draft
+            st.session_state.next_problem_section = "新增题目"
             navigate_on_next_rerun("题库与评测")
-            set_flash("success", "草稿已载入。请在“题库与评测 → 新增题目”中人工审阅。")
+            set_flash("success", "草稿已载入新增题目页，请人工审阅后保存。")
             st.rerun()
     elif data["status"] == "cancelled":
         st.warning("任务已中断，后台不会继续调用模型。")
@@ -1229,6 +1281,7 @@ def main() -> None:
         pages = {
             "账户概览": page_account,
             "题库与评测": page_problems,
+            "提交记录": page_submission_records,
             "AI 智能命题": page_ai,
         }
         if login["role"] == "admin":
@@ -1277,6 +1330,7 @@ def main() -> None:
                 format_func=lambda page: {
                     "账户概览": "👤 账户概览",
                     "题库与评测": "💻 题库与评测",
+                    "提交记录": "📋 提交记录",
                     "AI 智能命题": "✨ AI 智能命题",
                     "后台管理": "⚙️ 后台管理",
                 }.get(page, page),
