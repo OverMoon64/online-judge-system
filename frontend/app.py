@@ -922,14 +922,38 @@ def live_ai_task_panel() -> None:
     st.progress(data.get("progress_percent", 0), text=data.get("progress", ""))
     usage = data.get("usage") or {}
     st.caption(f"模型配置：{usage.get('model_config_name', '—')} · 模型：{usage.get('model', '—')}")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("输入 Token", usage.get("input_tokens", 0))
-    col2.metric("输出 Token", usage.get("output_tokens", 0))
+    col2.metric("输出 Token（含思考）", usage.get("output_tokens", 0))
+    col3.metric("模型请求", usage.get("request_count", 0))
     currency = usage.get("currency", "CNY")
     cost = float(usage.get("cost", 0) or 0)
-    col3.metric("本次花费", f"¥{cost:.2f}" if currency == "CNY" else f"{cost:.2f} {currency}")
+    col4.metric("本次花费", f"¥{cost:.2f}" if currency == "CNY" else f"{cost:.2f} {currency}")
+    detail_parts = [f"提供商合计 {usage.get('provider_total_tokens', 0)} Token"]
+    if usage.get("reasoning_tokens"):
+        detail_parts.append(f"其中思考 {usage['reasoning_tokens']} Token（已包含在输出中）")
+    if usage.get("cached_input_tokens"):
+        detail_parts.append(f"缓存输入 {usage['cached_input_tokens']} Token")
+    st.caption(" · ".join(detail_parts))
+    calls = usage.get("calls") or []
+    if calls:
+        with st.expander("查看分阶段 Token 明细"):
+            st.dataframe(
+                [
+                    {
+                        "阶段": call.get("stage", "—"),
+                        "请求次数": call.get("request_count", 0),
+                        "输入 Token": call.get("input_tokens", 0),
+                        "输出 Token": call.get("output_tokens", 0),
+                        "其中思考": call.get("reasoning_tokens", 0),
+                    }
+                    for call in calls
+                ],
+                hide_index=True,
+                width="stretch",
+            )
     if usage.get("estimated"):
-        st.caption("模型未返回完整 usage，当前 Token 与费用无法精确统计。")
+        st.warning("部分请求未返回完整 usage 或发生过重试，Token 与费用为当前可得数据的估算值。")
     if data["status"] in {"pending", "running"}:
         stream_result = data.get("result") or {}
         stream_preview = stream_result.get("stream_preview", "")
@@ -1080,6 +1104,8 @@ def page_ai() -> None:
                             set_flash("success", f"模型配置 {item['name']} 已删除。")
                             st.rerun()
                     st.caption(item["provider_url"])
+                    if item.get("pricing_note"):
+                        st.caption(f"计价依据：{item['pricing_note']}")
                     input_col, output_col, cost_col = st.columns(3)
                     input_col.metric("累计输入 Token", usage.get("input_tokens", 0))
                     output_col.metric("累计输出 Token", usage.get("output_tokens", 0))
@@ -1092,21 +1118,75 @@ def page_ai() -> None:
                     )
 
         st.markdown("#### 添加或更新模型")
-        with st.form("ai_config"):
-            config_name = st.text_input("配置名称 *", placeholder="例如：百炼主模型")
+        pending_price = st.session_state.pop("pending_ai_price", None)
+        if pending_price:
+            st.session_state.ai_config_input_price = pending_price["input_price"]
+            st.session_state.ai_config_output_price = pending_price["output_price"]
+            st.session_state.ai_config_price_unit = pending_price["price_unit"]
+            st.session_state.ai_config_currency = pending_price["currency"]
+            st.session_state.ai_price_metadata = pending_price
+        with st.container(border=True):
+            config_name = st.text_input(
+                "配置名称 *", placeholder="例如：百炼主模型", key="ai_config_name"
+            )
             provider_url = st.text_input(
                 "提供商 Base URL *",
                 placeholder="https://你的业务空间地址/compatible-mode/v1",
+                key="ai_config_provider_url",
             )
-            model = st.text_input("模型名称 *", placeholder="例如 qwen3.7-plus")
-            api_key = st.text_input("API Key *", type="password")
+            model = st.text_input(
+                "模型名称 *", placeholder="例如 qwen3.7-plus", key="ai_config_model"
+            )
+            auto_price_col, price_help_col = st.columns([1, 4], vertical_alignment="center")
+            if auto_price_col.button("识别官方单价", width="stretch"):
+                if not provider_url.strip() or not model.strip():
+                    st.error("请先填写 Base URL 和模型名称。")
+                else:
+                    pricing = api_call(
+                        "GET",
+                        "/api/ai/model-pricing",
+                        params={"provider_url": provider_url.strip(), "model": model.strip()},
+                        quiet=True,
+                    )
+                    if pricing.get("code") == 200:
+                        detected = dict(pricing["data"])
+                        detected.update(
+                            {"provider_url": provider_url.strip(), "model": model.strip()}
+                        )
+                        st.session_state.pending_ai_price = detected
+                        st.rerun()
+                    else:
+                        st.warning(pricing.get("msg", "无法识别价格，请手动填写。"))
+            price_help_col.caption(
+                "协议没有统一价格接口；已知官方模型可一键带入，其他模型保留手动计价。"
+            )
+            metadata = st.session_state.get("ai_price_metadata") or {}
+            if metadata:
+                st.info(f"{metadata.get('price_source')}：{metadata.get('pricing_note')}")
+            api_key = st.text_input("API Key *", type="password", key="ai_config_api_key")
             left, right = st.columns(2)
-            input_price = left.number_input("输入单价", 0.0, value=0.0, format="%.6f")
-            output_price = right.number_input("输出单价", 0.0, value=0.0, format="%.6f")
-            price_unit = st.number_input("计价单位（Token）", 1, value=1_000_000)
-            currency = st.text_input("币种", value="CNY")
-            submitted = st.form_submit_button("保存配置", type="primary")
+            input_price = left.number_input(
+                "输入单价", 0.0, value=0.0, format="%.6f", key="ai_config_input_price"
+            )
+            output_price = right.number_input(
+                "输出单价", 0.0, value=0.0, format="%.6f", key="ai_config_output_price"
+            )
+            price_unit = st.number_input(
+                "计价单位（Token）", 1, value=1_000_000, key="ai_config_price_unit"
+            )
+            currency = st.text_input("币种", value="CNY", key="ai_config_currency")
+            disable_thinking = st.checkbox(
+                "对支持的 Qwen 模型关闭思考模式（推荐，可显著减少输出 Token）",
+                value=True,
+                key="ai_config_disable_thinking",
+            )
+            submitted = st.button("保存配置", type="primary")
         if submitted:
+            price_metadata = st.session_state.get("ai_price_metadata") or {}
+            detected_for_current = (
+                price_metadata.get("provider_url") == provider_url.strip()
+                and price_metadata.get("model") == model.strip()
+            )
             result = api_call(
                 "PUT",
                 "/api/ai/model-config",
@@ -1119,6 +1199,20 @@ def page_ai() -> None:
                     "output_price": output_price,
                     "price_unit": price_unit,
                     "currency": currency,
+                    "disable_thinking": disable_thinking,
+                    "price_source": (
+                        price_metadata.get("price_source", "manual")
+                        if detected_for_current
+                        else "manual"
+                    ),
+                    "price_source_url": (
+                        price_metadata.get("price_source_url") if detected_for_current else None
+                    ),
+                    "pricing_note": (
+                        price_metadata.get("pricing_note", "")
+                        if detected_for_current
+                        else "手动计价"
+                    ),
                 },
             )
             if result.get("code") == 200:
