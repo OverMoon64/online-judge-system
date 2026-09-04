@@ -4,9 +4,50 @@ import asyncio
 import json
 
 import httpx
+import pytest
+from pydantic import ValidationError
 
 from app import ai_service
+from app.schemas import AIModelConfigPayload
 from tests.conftest import login
+
+
+def test_model_config_name_rejects_path_separators():
+    with pytest.raises(ValidationError):
+        AIModelConfigPayload(
+            name="primary/model",
+            provider_url="https://example.test/v1",
+            model="fake-model",
+            api_key="secret",
+        )
+
+
+async def test_provider_failure_retries_twice(monkeypatch):
+    attempts = 0
+
+    async def flaky_provider(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RuntimeError("temporary failure")
+        return "ok", {"input_tokens": 1, "output_tokens": 1}
+
+    async def no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(ai_service, "_provider_request", flaky_provider)
+    monkeypatch.setattr(ai_service.asyncio, "sleep", no_delay)
+    config = AIModelConfigPayload(
+        name="retry-model",
+        provider_url="https://example.test/v1",
+        model="fake-model",
+        api_key="secret",
+    )
+
+    result = await ai_service._provider_request_with_retry(config, [])
+
+    assert result[0] == "ok"
+    assert attempts == 3
 
 
 def generated_payload() -> dict:
@@ -48,6 +89,7 @@ async def test_ai_config_generation_usage_and_secret_masking(
 ) -> None:
     await login(client)
     config = {
+        "name": "primary",
         "provider_url": "https://example-model-provider.test/v1",
         "model": "course-demo-model",
         "api_key": "top-secret-key",
@@ -60,12 +102,33 @@ async def test_ai_config_generation_usage_and_secret_masking(
     assert configured.status_code == 200
     assert "top-secret-key" not in configured.text
     assert "top-secret-key" not in (await client.get("/api/ai/model-config")).text
+    backup = await client.put(
+        "/api/ai/model-config",
+        json={
+            **config,
+            "name": "backup",
+            "model": "backup-model",
+            "api_key": "backup-secret-key",
+        },
+    )
+    assert backup.status_code == 200
+    listed = await client.get("/api/ai/model-configs/")
+    assert listed.status_code == 200
+    assert listed.json()["data"]["active"] == "backup"
+    assert {item["name"] for item in listed.json()["data"]["models"]} == {
+        "primary",
+        "backup",
+    }
+    assert "top-secret-key" not in listed.text
+    assert "backup-secret-key" not in listed.text
 
     calls = 0
+    used_models: set[str] = set()
 
-    async def fake_provider(*_args, **_kwargs):
+    async def fake_provider(provider_config, *_args, **_kwargs):
         nonlocal calls
         calls += 1
+        used_models.add(provider_config.model)
         content = "命题蓝图" if calls == 1 else json.dumps(generated_payload(), ensure_ascii=False)
         return content, {"input_tokens": 100, "output_tokens": 50}
 
@@ -74,6 +137,7 @@ async def test_ai_config_generation_usage_and_secret_masking(
         "/api/ai/problem-tasks/",
         json={
             "requirement": "设计一道用于入门课程的三个整数求和题目",
+            "model_config_name": "primary",
             "knowledge_points": ["标准输入输出"],
             "difficulty": "入门",
             "testcase_count": 3,
@@ -87,6 +151,13 @@ async def test_ai_config_generation_usage_and_secret_masking(
     assert task["usage"]["input_tokens"] == 200
     assert task["usage"]["output_tokens"] == 100
     assert task["usage"]["cost"] == 0.0012
+    assert task["usage"]["model_config_name"] == "primary"
+    assert used_models == {"course-demo-model"}
+    listed = await client.get("/api/ai/model-configs/")
+    primary = next(item for item in listed.json()["data"]["models"] if item["name"] == "primary")
+    assert primary["usage"]["input_tokens"] == 200
+    assert primary["usage"]["output_tokens"] == 100
+    assert primary["usage"]["cost"] == 0.0012
 
 
 async def test_ai_task_can_be_actually_cancelled(client: httpx.AsyncClient, monkeypatch) -> None:

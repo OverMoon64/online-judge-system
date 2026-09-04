@@ -10,4 +10,5 @@ python-multipart>=0.0.20,<1
 psutil>=6.1,<8
 httpx>=0.28,<1
 streamlit>=1.41,<2
-
+streamlit-code-editor>=0.1.22,<0.2
+cryptography>=44,<47

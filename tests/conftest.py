@@ -15,6 +15,7 @@ from app.main import app
 async def client(tmp_path) -> AsyncIterator[httpx.AsyncClient]:
     await cancel_all_submission_tasks()
     await ai_service.cancel_all_ai_tasks(clear_configs=True)
+    await ai_service.configure_model_store(tmp_path / "ai-model-configs.enc")
     database_file = tmp_path / "test.db"
     await configure_database(f"sqlite+aiosqlite:///{database_file}")
     await initialize_database()

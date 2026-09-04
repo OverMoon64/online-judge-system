@@ -173,7 +173,7 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     assert total["estimated"] is False
 
 
-def test_private_ai_provider_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_private_ai_provider_rules(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     local = AIModelConfigPayload(
         provider_url="http://127.0.0.1:9999/v1",
         model="local",
@@ -182,13 +182,30 @@ def test_private_ai_provider_rules(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ai_service,
         "get_settings",
-        lambda: SimpleNamespace(allow_local_ai=True),
+        lambda: SimpleNamespace(
+            allow_local_ai=True,
+            session_secret="test-encryption-secret",
+            ai_config_file=str(tmp_path / "fallback.enc"),
+        ),
     )
-    public = ai_service.set_model_config(123, local)
+    store = tmp_path / "models.enc"
+    await ai_service.configure_model_store(store)
+    public = await ai_service.set_model_config(123, local)
     assert public["api_key_configured"] is True
     assert "api_key" not in public
-    assert ai_service.get_model_config(123) == public
-    assert ai_service.get_model_config(999) is None
+    assert await ai_service.get_model_config(123) == public
+    encrypted = store.read_bytes()
+    assert b"secret" not in encrypted
+    assert b"local" not in encrypted
+
+    # Simulate a process restart: clear memory, point at the same encrypted file,
+    # and ensure the model can be selected without entering the key again.
+    await ai_service.configure_model_store(store)
+    restored = await ai_service.list_model_configs(123)
+    assert restored["active"] == "默认模型"
+    assert restored["models"][0]["model"] == "local"
+    assert "api_key" not in restored["models"][0]
+    assert await ai_service.get_model_config(999) is None
 
 
 def test_process_memory_probe_handles_missing_process() -> None:
