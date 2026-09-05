@@ -99,6 +99,20 @@ async def test_change_password_requires_owner_and_current_password(
     assert (await login(client, "alice", "new-password123")).status_code == 200
 
 
+async def test_logout_revokes_a_replayed_signed_session_cookie(client: httpx.AsyncClient) -> None:
+    assert (await login(client)).status_code == 200
+    signed_session = client.cookies.get("oj_session")
+    assert signed_session
+
+    assert (await client.post("/api/auth/logout")).status_code == 200
+    client.cookies.clear()
+    client.cookies.set("oj_session", signed_session)
+
+    response = await client.get("/api/auth/session")
+    assert response.status_code == 401
+    assert response.json() == {"code": 401, "msg": "not logged in", "data": None}
+
+
 async def test_validation_pagination_and_permission_priority(
     client: httpx.AsyncClient,
 ) -> None:

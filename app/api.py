@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from datetime import timedelta
 from typing import Any
 
@@ -200,7 +201,10 @@ async def login(request: Request, session: SessionDep) -> dict[str, Any]:
     if user.role == "banned":
         raise ApiError(403, "user is banned")
     request.session.clear()
+    user.session_token = secrets.token_urlsafe(32)
     request.session["user_id"] = user.id
+    request.session["session_token"] = user.session_token
+    await session.commit()
     return success(
         {"user_id": str(user.id), "username": user.username, "role": user.role},
         "login success",
@@ -208,7 +212,11 @@ async def login(request: Request, session: SessionDep) -> dict[str, Any]:
 
 
 @router.post("/api/auth/logout")
-async def logout(request: Request, _: CurrentUser) -> dict[str, Any]:
+async def logout(
+    request: Request, session: SessionDep, current_user: CurrentUser
+) -> dict[str, Any]:
+    current_user.session_token = None
+    await session.commit()
     request.session.clear()
     return success(None, "logout success")
 

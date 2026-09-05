@@ -33,6 +33,7 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(40), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(16), default="user", index=True)
+    session_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     join_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -175,6 +176,7 @@ def builtin_languages() -> list[Language]:
 async def initialize_database() -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.run_sync(_ensure_schema_compatibility)
 
     async with session_factory() as session:
         if await session.get(User, 1) is None:
@@ -190,6 +192,14 @@ async def initialize_database() -> None:
             if await session.get(Language, language.name) is None:
                 session.add(language)
         await session.commit()
+
+
+def _ensure_schema_compatibility(connection: Any) -> None:
+    if connection.dialect.name != "sqlite":
+        return
+    columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(users)")}
+    if "session_token" not in columns:
+        connection.exec_driver_sql("ALTER TABLE users ADD COLUMN session_token VARCHAR(64)")
 
 
 async def reset_database() -> None:
