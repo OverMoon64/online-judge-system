@@ -108,6 +108,37 @@ async def test_cpp_compilation_success_and_failure(client: httpx.AsyncClient) ->
     assert failure_result["result"] == "CE"
 
 
+@pytest.mark.integration
+@pytest.mark.skipif(shutil.which("gcc") is None, reason="gcc is not installed")
+async def test_dynamically_registered_c_language_can_judge(client: httpx.AsyncClient) -> None:
+    await login(client)
+    await add_sum_problem(client)
+    language = await client.post(
+        "/api/languages/",
+        json={
+            "name": "c17",
+            "file_ext": ".c",
+            "compile_cmd": "gcc {src} -std=c17 -O2 -o {exe}",
+            "run_cmd": "{exe}",
+            "time_limit": 3,
+            "memory_limit": 128,
+        },
+    )
+    assert language.status_code == 200
+
+    submission_id = await _submit(
+        client,
+        "#include <stdio.h>\nint main(void){long long a,b;"
+        'if(scanf("%lld%lld",&a,&b)!=2)return 1;printf("%lld\\n",a+b);}\n',
+        "c17",
+    )
+    await wait_for_submission(int(submission_id), timeout=30)
+    result = (await client.get(f"/api/submissions/{submission_id}")).json()["data"]
+    assert result["result"] == "AC"
+    assert result["score"] == result["counts"] == 30
+    assert result["compile_info"]["result"] == "success"
+
+
 async def test_private_and_public_log_access_is_audited(client: httpx.AsyncClient) -> None:
     await login(client)
     await add_sum_problem(client)
