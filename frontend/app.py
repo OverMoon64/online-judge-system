@@ -89,27 +89,63 @@ MODEL_COMPATIBILITY = [
         "推理控制": "reasoning_effort；不支持时自动回退",
     },
 ]
-STRESS_PROMPT_EXAMPLES = [
-    (
-        "单整数边界",
-        "生成斐波那契数列取模题。输入仅一个整数 N，明确约束 0 <= N <= 1000000，"
-        "要求使用最大规模大数据严格验证递推复杂度，并生成 Python 和 C++ 参考解法。",
-    ),
-    (
-        "整数数组",
-        "生成逆序对计数题。输入第一行是 N，第二行是 N 个互不相同的整数，明确约束 "
-        "1 <= N <= 75000；要求用最大规模数组压力测试淘汰 O(N^2) 暴力算法。",
-    ),
-    (
-        "整数网格",
-        "生成整数网格最大路径和题。输入第一行 N M，随后 N 行每行 M 个整数，明确约束 "
-        "1 <= N <= 300、1 <= M <= 300；要求使用大数据严格验证时间复杂度。",
-    ),
-    (
-        "链式图",
-        "生成无向图连通性题。输入第一行 N M，随后 M 行每行两个端点，明确约束 "
-        "1 <= N <= 30000、0 <= M <= 60000；要求生成最大规模链式图压力测试。",
-    ),
+LANGUAGE_COMPATIBILITY = [
+    {
+        "语言": "Python 3（内置）",
+        "扩展名": ".py",
+        "编译命令": "—",
+        "运行命令": "python3 {src}",
+        "所需程序": "python3",
+    },
+    {
+        "语言": "C++14（内置）",
+        "扩展名": ".cpp",
+        "编译命令": "g++ {src} -std=c++14 -O2 -o {exe}",
+        "运行命令": "{exe}",
+        "所需程序": "g++",
+    },
+    {
+        "语言": "C11 / C17",
+        "扩展名": ".c",
+        "编译命令": "gcc {src} -std=c17 -O2 -o {exe}",
+        "运行命令": "{exe}",
+        "所需程序": "gcc",
+    },
+    {
+        "语言": "C++17 / C++20",
+        "扩展名": ".cpp",
+        "编译命令": "g++ {src} -std=c++17 -O2 -o {exe}",
+        "运行命令": "{exe}",
+        "所需程序": "g++ 或 clang++",
+    },
+    {
+        "语言": "Java 11+",
+        "扩展名": ".java",
+        "编译命令": "—",
+        "运行命令": "java {src}",
+        "所需程序": "java",
+    },
+    {
+        "语言": "JavaScript",
+        "扩展名": ".js",
+        "编译命令": "—",
+        "运行命令": "node {src}",
+        "所需程序": "node",
+    },
+    {
+        "语言": "Ruby",
+        "扩展名": ".rb",
+        "编译命令": "—",
+        "运行命令": "ruby {src}",
+        "所需程序": "ruby",
+    },
+    {
+        "语言": "Go",
+        "扩展名": ".go",
+        "编译命令": "go build -o {exe} {src}",
+        "运行命令": "{exe}",
+        "所需程序": "go",
+    },
 ]
 
 
@@ -1245,10 +1281,6 @@ def page_ai() -> None:
                 if result.get("code") == 200:
                     st.session_state.ai_task_id = result["data"]["task_id"]
                     st.success(f"任务已创建：{result['data']['task_id']}")
-        with st.expander("可复制的文件压力点测试需求"):
-            for title, example in STRESS_PROMPT_EXAMPLES:
-                st.markdown(f"**{title}**")
-                st.code(example, language=None, wrap_lines=True)
         live_ai_task_panel()
 
     with config_tab:
@@ -1310,11 +1342,6 @@ def page_ai() -> None:
                 "计价单位（Token）", 1, value=1_000_000, key="ai_config_price_unit"
             )
             currency = st.text_input("币种", value="CNY", key="ai_config_currency")
-            disable_thinking = st.checkbox(
-                "“自动”推理强度下关闭百炼 Qwen 思考模式",
-                value=True,
-                key="ai_config_disable_thinking",
-            )
             submitted = st.button("保存配置", type="primary")
         if submitted:
             result = api_call(
@@ -1329,7 +1356,6 @@ def page_ai() -> None:
                     "output_price": output_price,
                     "price_unit": price_unit,
                     "currency": currency,
-                    "disable_thinking": disable_thinking,
                 },
             )
             if result.get("code") == 200:
@@ -1389,6 +1415,9 @@ def render_language_management() -> None:
     if current.get("code") == 200:
         names = current["data"]["name"]
         st.info("当前语言：" + ("、".join(names) if names else "暂无"))
+    with st.expander("可添加语言与命令示例"):
+        st.dataframe(LANGUAGE_COMPATIBILITY, hide_index=True, width="stretch")
+        st.caption("添加前请确认对应程序已安装；命令仅支持 {src}、{exe} 占位符。")
     with st.form("language_form"):
         name = st.text_input("语言名称 *", placeholder="例如 go")
         extension = st.text_input("文件扩展名 *", placeholder="例如 .go")

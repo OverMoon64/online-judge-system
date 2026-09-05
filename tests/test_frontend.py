@@ -6,9 +6,9 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from frontend.app import (
+    LANGUAGE_COMPATIBILITY,
     MODEL_COMPATIBILITY,
     REASONING_LABELS,
-    STRESS_PROMPT_EXAMPLES,
     compact_preview,
     output_calibration_rows,
     resolve_problem_selection,
@@ -18,13 +18,23 @@ from frontend.app import (
 )
 
 
-def test_ai_page_lists_required_model_families_and_stress_examples() -> None:
+def test_ai_page_lists_required_model_families_and_reasoning_levels() -> None:
     compatibility = " ".join(str(item) for item in MODEL_COMPATIBILITY)
     assert all(name in compatibility for name in ("Qwen", "DeepSeek", "Kimi"))
     assert "OpenAI-compatible" in compatibility
     assert set(REASONING_LABELS) == {"auto", "low", "medium", "high", "max"}
-    assert len(STRESS_PROMPT_EXAMPLES) >= 4
-    assert all("大数据" in prompt or "压力" in prompt for _, prompt in STRESS_PROMPT_EXAMPLES)
+
+
+def test_language_page_lists_supported_command_templates() -> None:
+    compatibility = " ".join(str(item) for item in LANGUAGE_COMPATIBILITY)
+    assert all(
+        name in compatibility
+        for name in ("Python", "C++14", "C17", "Java", "JavaScript", "Ruby", "Go")
+    )
+    assert all(
+        "{src}" in item["运行命令"] or "{exe}" in item["运行命令"]
+        for item in LANGUAGE_COMPATIBILITY
+    )
 
 
 @pytest.mark.parametrize(
