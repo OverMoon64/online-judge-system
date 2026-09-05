@@ -19,6 +19,7 @@ from app import db as database
 from app.config import get_settings
 from app.db import Language, Problem, Submission, utc_now
 from app.schemas import ProblemPayload
+from app.testcase_files import load_file_testcases
 
 _running_tasks: dict[int, asyncio.Task[None]] = {}
 _unsafe_command_chars = re.compile(r"[;&|><`\n\r\x00]")
@@ -234,10 +235,22 @@ async def _judge_submission(submission_id: int) -> None:
                 await session.commit()
                 return
             code = submission.code
+            file_testcases = await load_file_testcases(problem)
             problem_data = {
                 "time_limit": problem.time_limit or language.time_limit or 3.0,
                 "memory_limit": problem.memory_limit or language.memory_limit or 128,
-                "testcases": list(problem.testcases),
+                "testcases": [
+                    *list(problem.testcases),
+                    *(
+                        {
+                            "input": case["input"],
+                            "output": case["output"],
+                            "source": "file",
+                            "label": case["label"],
+                        }
+                        for case in file_testcases
+                    ),
+                ],
             }
             language_data = {
                 "file_ext": language.file_ext,
@@ -265,8 +278,14 @@ async def _judge_submission(submission_id: int) -> None:
                     )
                     compile_info = {"result": "failed", "message": message}
                     details = [
-                        {"id": index, "result": "CE", "time": 0.0, "memory": 0.0}
-                        for index, _ in enumerate(problem_data["testcases"], start=1)
+                        {
+                            "id": index,
+                            "result": "CE",
+                            "time": 0.0,
+                            "memory": 0.0,
+                            "source": testcase.get("source", "inline"),
+                        }
+                        for index, testcase in enumerate(problem_data["testcases"], start=1)
                     ]
                     await _store_result(
                         submission_id,
@@ -311,6 +330,7 @@ async def _judge_submission(submission_id: int) -> None:
                         "result": outcome if outcome in {"AC", "WA", "TLE", "MLE", "RE"} else "UNK",
                         "time": round(result.elapsed, 4),
                         "memory": round(result.peak_memory_mb, 3),
+                        "source": testcase.get("source", "inline"),
                     }
                 )
 

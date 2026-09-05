@@ -47,13 +47,20 @@ from app.schemas import (
     SubmissionPayload,
 )
 from app.security import hash_password, verify_password
+from app.testcase_files import (
+    clear_testcase_store,
+    count_file_testcases,
+    problem_fingerprint,
+    remove_file_testcases,
+)
 
 router = APIRouter()
 
 
-def _problem_data(problem: Problem) -> dict[str, Any]:
+async def _problem_data(problem: Problem) -> dict[str, Any]:
     data = problem_to_dict(problem)
     data["public_cases"] = problem.public_cases
+    data["file_testcase_count"] = await count_file_testcases(problem)
     return data
 
 
@@ -275,6 +282,8 @@ async def add_problem(request: Request, session: SessionDep, _: CurrentUser) -> 
     problem = Problem(**payload.model_dump())
     session.add(problem)
     await session.commit()
+    if await count_file_testcases(problem) == 0:
+        await remove_file_testcases(problem.id)
     return success({"id": problem.id}, "add success")
 
 
@@ -283,7 +292,7 @@ async def get_problem(problem_id: str, session: SessionDep, _: CurrentUser) -> d
     problem = await session.get(Problem, problem_id)
     if problem is None:
         raise ApiError(404, "problem not found")
-    return success(_problem_data(problem))
+    return success(await _problem_data(problem))
 
 
 @router.put("/api/problems/{problem_id}")
@@ -296,9 +305,12 @@ async def edit_problem(
     problem = await session.get(Problem, problem_id)
     if problem is None:
         raise ApiError(404, "problem not found")
+    previous_fingerprint = problem_fingerprint(problem)
     for key, value in payload.model_dump().items():
         setattr(problem, key, value)
     await session.commit()
+    if problem_fingerprint(problem) != previous_fingerprint:
+        await remove_file_testcases(problem_id)
     return success({"id": problem.id}, "update success")
 
 
@@ -317,6 +329,7 @@ async def delete_problem(problem_id: str, session: SessionDep, _: AdminUser) -> 
     await session.execute(delete(AccessLog).where(AccessLog.problem_id == problem_id))
     await session.delete(problem)
     await session.commit()
+    await remove_file_testcases(problem_id)
     return success({"id": problem_id}, "delete success")
 
 
@@ -629,5 +642,6 @@ async def reset_system(request: Request, session: SessionDep) -> dict[str, Any]:
     await session.rollback()
     await session.close()
     await reset_database()
+    await clear_testcase_store()
     request.session.clear()
     return success(None, "system reset successfully")
