@@ -212,7 +212,7 @@ def clear_local_session(*, close_client: bool = False) -> None:
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if str(key).startswith(("judge_code_", "judge_editor_", "submit_code_")):
+        if str(key).startswith(("judge_code_", "judge_editor_", "submit_code_", "ai_config_")):
             st.session_state.pop(key, None)
     if close_client:
         close_persistent_client(st.session_state)

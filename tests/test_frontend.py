@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from frontend import app as frontend_app
 from frontend.app import (
     LANGUAGE_COMPATIBILITY,
     MODEL_COMPATIBILITY,
@@ -35,6 +36,23 @@ def test_language_page_lists_supported_command_templates() -> None:
         "{src}" in item["运行命令"] or "{exe}" in item["运行命令"]
         for item in LANGUAGE_COMPATIBILITY
     )
+
+
+def test_logout_clears_sensitive_model_form_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = {
+        "login": {"user_id": "1", "username": "admin", "role": "admin"},
+        "ai_config_api_key": "secret",
+        "ai_config_provider_url": "https://provider.example/v1",
+        "judge_code_problem_python": "print('user code')",
+        "unrelated_preference": "keep",
+    }
+    monkeypatch.setattr(frontend_app.st, "session_state", state)
+    frontend_app.clear_local_session()
+    assert "login" not in state
+    assert "ai_config_api_key" not in state
+    assert "ai_config_provider_url" not in state
+    assert "judge_code_problem_python" not in state
+    assert state["unrelated_preference"] == "keep"
 
 
 @pytest.mark.parametrize(
