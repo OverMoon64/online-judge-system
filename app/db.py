@@ -129,6 +129,7 @@ def _make_engine(url: str) -> AsyncEngine:
         def _enable_foreign_keys(dbapi_connection: Any, _: Any) -> None:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
 
     return created
