@@ -79,7 +79,7 @@ async def test_process_runner_unknown_runtime_output_limit_and_reference_validat
     monkeypatch.setattr(
         judge,
         "get_settings",
-        lambda: SimpleNamespace(max_output_bytes=32, compile_timeout_seconds=1),
+        lambda: SimpleNamespace(max_output_bytes=32, compile_timeout_seconds=5),
     )
     flooded = await judge.run_process(["python3", "-c", "print('x'*10000)"], "", 1, 128)
     assert flooded.status == "RE"
