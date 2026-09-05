@@ -319,6 +319,24 @@ def resolve_problem_selection(
     return problem_ids[0] if problem_ids else None
 
 
+def submission_list_params(
+    login: dict[str, Any],
+    *,
+    problem_id: str,
+    page: int,
+    selected_user_id: str | None = None,
+) -> dict[str, Any] | None:
+    user_id = selected_user_id if login.get("role") == "admin" else str(login["user_id"])
+    if not user_id and not problem_id:
+        return None
+    params: dict[str, Any] = {"page": page, "page_size": 5}
+    if user_id:
+        params["user_id"] = user_id
+    if problem_id:
+        params["problem_id"] = problem_id
+    return params
+
+
 def api_call(method: str, path: str, *, quiet: bool = False, **kwargs: Any) -> dict[str, Any]:
     result = request_json(get_client(), method, path, **kwargs)
     if result.get("code") == 401 and st.session_state.get("login"):
@@ -989,8 +1007,29 @@ def page_submission_records() -> None:
     problem_result = api_call("GET", "/api/problems/", quiet=True)
     problems = problem_result.get("data") or []
 
-    filter_col, refresh_col = st.columns([4, 1])
-    filter_problem = filter_col.selectbox(
+    if login["role"] == "admin":
+        users_result = api_call("GET", "/api/users/?page_size=200", quiet=True)
+        users = (users_result.get("data") or {}).get("users", [])
+        user_options = {
+            f"本人 · {login['username']}": str(login["user_id"]),
+            "全部用户（需选择题目）": "",
+        }
+        user_options.update(
+            {
+                f"{user['username']} (#{user['user_id']})": str(user["user_id"])
+                for user in users
+                if str(user["user_id"]) != str(login["user_id"])
+            }
+        )
+        user_col, problem_col, refresh_col = st.columns([2, 2, 1])
+        selected_user = user_col.selectbox(
+            "用户筛选", list(user_options), key="submission_user_filter"
+        )
+        selected_user_id = user_options[selected_user]
+    else:
+        problem_col, refresh_col = st.columns([4, 1])
+        selected_user_id = str(login["user_id"])
+    filter_problem = problem_col.selectbox(
         "题目筛选",
         [""] + [item["id"] for item in problems],
         format_func=lambda x: x or "全部题目",
@@ -999,14 +1038,20 @@ def page_submission_records() -> None:
     refresh_col.write("")
     refresh_col.write("")
     refresh_col.button("刷新记录", width="stretch")
-    filter_signature = filter_problem
+    filter_signature = (selected_user_id, filter_problem)
     if st.session_state.get("submission_filter_signature") != filter_signature:
         st.session_state.submission_filter_signature = filter_signature
         st.session_state.submission_page = 1
     current_page = int(st.session_state.get("submission_page", 1))
-    params = {"user_id": login["user_id"], "page": current_page, "page_size": 5}
-    if filter_problem:
-        params["problem_id"] = filter_problem
+    params = submission_list_params(
+        login,
+        problem_id=filter_problem,
+        page=current_page,
+        selected_user_id=selected_user_id,
+    )
+    if params is None:
+        st.info("查看全部用户提交时，请先选择一道题目。")
+        return
     with st.spinner("正在读取提交记录……"):
         records = api_call("GET", "/api/submissions/", params=params, quiet=True)
     if records.get("code") != 200:

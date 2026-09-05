@@ -15,6 +15,7 @@ from frontend.app import (
     resolve_problem_selection,
     resource_limit_summary,
     status_badge,
+    submission_list_params,
     submission_verdict,
 )
 
@@ -125,6 +126,28 @@ def test_problem_selection_survives_reruns_and_problem_list_changes() -> None:
     assert resolve_problem_selection(problem_ids, "chosen") == "chosen"
     assert resolve_problem_selection(problem_ids, "missing") == "first"
     assert resolve_problem_selection([], "chosen") is None
+
+
+def test_submission_filters_respect_user_and_admin_api_rules() -> None:
+    user = {"user_id": "2", "username": "alice", "role": "user"}
+    assert submission_list_params(user, problem_id="", page=2, selected_user_id="99") == {
+        "user_id": "2",
+        "page": 2,
+        "page_size": 5,
+    }
+
+    admin = {"user_id": "1", "username": "admin", "role": "admin"}
+    assert submission_list_params(admin, problem_id="", page=1, selected_user_id="2") == {
+        "user_id": "2",
+        "page": 1,
+        "page_size": 5,
+    }
+    assert submission_list_params(admin, problem_id="sum_2", page=3, selected_user_id="") == {
+        "problem_id": "sum_2",
+        "page": 3,
+        "page_size": 5,
+    }
+    assert submission_list_params(admin, problem_id="", page=1, selected_user_id="") is None
 
 
 def test_resource_limit_summary_explains_automatic_decision() -> None:
