@@ -17,6 +17,7 @@ from frontend.app import (
     status_badge,
     submission_list_params,
     submission_verdict,
+    validity_check_rows,
 )
 
 
@@ -118,6 +119,23 @@ def test_output_calibration_rows_are_readable() -> None:
     }
     assert rows[1]["类型"] == "隐藏测试点"
     assert rows[1]["模型原答案"] == ""
+
+
+def test_testcase_validity_rows_explain_passed_and_review_items() -> None:
+    rows = validity_check_rows(
+        {
+            "testcase_validity": {
+                "checks": [
+                    {"label": "边界覆盖", "passed": True, "detail": "已覆盖最小值"},
+                    {"label": "最大规模", "passed": False, "detail": "请人工补充"},
+                ]
+            }
+        }
+    )
+    assert rows == [
+        {"检查项": "边界覆盖", "结果": "通过", "依据": "已覆盖最小值"},
+        {"检查项": "最大规模", "结果": "需复核", "依据": "请人工补充"},
+    ]
 
 
 def test_problem_selection_survives_reruns_and_problem_list_changes() -> None:

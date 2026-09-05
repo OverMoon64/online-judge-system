@@ -356,6 +356,18 @@ def output_calibration_rows(validation: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def validity_check_rows(validation: dict[str, Any]) -> list[dict[str, Any]]:
+    report = validation.get("testcase_validity") or {}
+    return [
+        {
+            "检查项": check.get("label", check.get("key", "—")),
+            "结果": "通过" if check.get("passed") else "需复核",
+            "依据": check.get("detail", ""),
+        }
+        for check in report.get("checks") or []
+    ]
+
+
 def resource_limit_summary(validation: dict[str, Any]) -> str | None:
     policy = validation.get("resource_limits") or {}
     final = policy.get("final") or {}
@@ -1271,6 +1283,20 @@ def live_ai_task_panel() -> None:
                         "校准答案": st.column_config.TextColumn(width="medium"),
                     },
                 )
+        testcase_validity = validation.get("testcase_validity") or {}
+        if testcase_validity:
+            score = int(testcase_validity.get("score", 0) or 0)
+            message = f"测试用例有效性：{score}/100"
+            if testcase_validity.get("passed"):
+                st.success(message)
+            else:
+                st.warning(f"{message}，请按检查明细人工补强。")
+            with st.expander("查看测试用例有效性检查"):
+                st.dataframe(
+                    validity_check_rows(validation),
+                    hide_index=True,
+                    width="stretch",
+                )
         file_stress = validation.get("file_stress") or {}
         if file_stress.get("applied"):
             st.info(
@@ -1278,7 +1304,7 @@ def live_ai_task_panel() -> None:
                 f"{file_stress.get('label', '压力测试')} · "
                 f"{file_stress.get('input_bytes', 0) / 1024:.1f} KiB"
             )
-        elif file_stress.get("requested"):
+        elif file_stress.get("attempted"):
             st.caption(f"文件压力点未启用：{file_stress.get('reason', '未通过安全校验')}")
         with st.container(border=True):
             st.subheader(f"{problem.get('id', '—')} · {problem.get('title', '未命名题目')}")
