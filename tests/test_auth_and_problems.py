@@ -21,6 +21,7 @@ async def test_error_envelope_and_auth_precedence(client: httpx.AsyncClient) -> 
 
 
 async def test_registration_login_roles_and_statistics(client: httpx.AsyncClient) -> None:
+    assert (await client.get("/api/auth/session")).status_code == 401
     alice = await register(client, "alice")
     duplicate = await client.post(
         "/api/users/", json={"username": "alice", "password": "password123"}
@@ -28,6 +29,13 @@ async def test_registration_login_roles_and_statistics(client: httpx.AsyncClient
     assert duplicate.status_code == 400
     assert (await login(client, "alice", "wrong-password")).status_code == 401
     assert (await login(client, "alice")).status_code == 200
+    restored = await client.get("/api/auth/session")
+    assert restored.status_code == 200
+    assert restored.json()["data"] == {
+        "user_id": alice["user_id"],
+        "username": "alice",
+        "role": "user",
+    }
 
     own_profile = await client.get(f"/api/users/{alice['user_id']}")
     assert own_profile.status_code == 200
@@ -35,6 +43,7 @@ async def test_registration_login_roles_and_statistics(client: httpx.AsyncClient
     assert (await client.get("/api/users/1")).status_code == 403
 
     await client.post("/api/auth/logout")
+    assert (await client.get("/api/auth/session")).status_code == 401
     await login(client)
     users = await client.get("/api/users/?page_size=10")
     assert users.status_code == 200

@@ -8,6 +8,9 @@ from typing import Any
 import httpx
 import streamlit as st
 from code_editor import code_editor
+from streamlit_cookies_manager import EncryptedCookieManager
+
+from app.config import get_settings
 
 try:
     from frontend.api_client import (
@@ -17,6 +20,13 @@ try:
         normalize_base_url,
         request_json,
     )
+    from frontend.browser_session import (
+        clear_browser_session,
+        load_browser_session,
+        restore_backend_session,
+        save_browser_session,
+        serialize_backend_session,
+    )
 except ModuleNotFoundError:  # Streamlit executes this file with frontend/ on sys.path.
     from api_client import (  # type: ignore[no-redef]
         clear_client_cookies,
@@ -24,6 +34,13 @@ except ModuleNotFoundError:  # Streamlit executes this file with frontend/ on sy
         get_persistent_client,
         normalize_base_url,
         request_json,
+    )
+    from browser_session import (  # type: ignore[no-redef]
+        clear_browser_session,
+        load_browser_session,
+        restore_backend_session,
+        save_browser_session,
+        serialize_backend_session,
     )
 
 st.set_page_config(page_title="在线评测系统", page_icon="⚖️", layout="wide")
@@ -195,7 +212,58 @@ def get_client() -> httpx.Client:
     return get_persistent_client(st.session_state, DEFAULT_API_BASE_URL)
 
 
+def initialize_browser_session() -> None:
+    try:
+        store = EncryptedCookieManager(
+            prefix="online-judge/",
+            password=get_settings().session_secret,
+        )
+    except Exception:
+        st.session_state["_browser_cookie_store"] = None
+        return
+    st.session_state["_browser_cookie_store"] = store
+    if not store.ready():
+        return
+
+    pending = st.session_state.pop("_browser_session_pending", None)
+    if isinstance(pending, str):
+        save_browser_session(store, pending)
+    if st.session_state.get("login") or st.session_state.get("_browser_restore_attempted"):
+        return
+
+    st.session_state["_browser_restore_attempted"] = True
+    if not restore_backend_session(get_client(), load_browser_session(store)):
+        return
+    restored = request_json(get_client(), "GET", "/api/auth/session")
+    if restored.get("code") == 200:
+        st.session_state["login"] = restored["data"]
+        return
+    clear_client_cookies(st.session_state)
+    clear_browser_session(store)
+
+
+def persist_current_browser_session() -> bool:
+    payload = serialize_backend_session(get_client())
+    if payload is None:
+        return False
+    st.session_state["_browser_session_pending"] = payload
+    store = st.session_state.get("_browser_cookie_store")
+    if store is not None and save_browser_session(store, payload):
+        st.session_state.pop("_browser_session_pending", None)
+        st.session_state["_browser_restore_attempted"] = True
+        return True
+    return False
+
+
+def clear_persisted_browser_session() -> None:
+    store = st.session_state.get("_browser_cookie_store")
+    clear_browser_session(store)
+    st.session_state.pop("_browser_session_pending", None)
+    st.session_state.pop("_browser_restore_attempted", None)
+
+
 def clear_local_session(*, close_client: bool = False) -> None:
+    clear_persisted_browser_session()
     for key in (
         "login",
         "last_submission_id",
@@ -403,6 +471,7 @@ def page_account() -> None:
                         )
                     if result.get("code") == 200:
                         st.session_state.login = result["data"]
+                        persist_current_browser_session()
                         navigate_on_next_rerun("账户概览")
                         set_flash("success", f"欢迎回来，{result['data']['username']}。")
                         st.rerun()
@@ -1621,6 +1690,7 @@ def page_admin() -> None:
 
 def main() -> None:
     inject_theme()
+    initialize_browser_session()
     login = st.session_state.get("login")
     pages: dict[str, Any]
     if login:

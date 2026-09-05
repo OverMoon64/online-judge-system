@@ -213,6 +213,17 @@ async def logout(request: Request, _: CurrentUser) -> dict[str, Any]:
     return success(None, "logout success")
 
 
+@router.get("/api/auth/session")
+async def get_login_session(session: SessionDep, current_user: CurrentUser) -> dict[str, Any]:
+    return success(
+        {
+            "user_id": str(current_user.id),
+            "username": current_user.username,
+            "role": current_user.role,
+        }
+    )
+
+
 @router.get("/api/users/")
 async def list_users(request: Request, session: SessionDep, _: AdminUser) -> dict[str, Any]:
     page, page_size = parse_pagination(
