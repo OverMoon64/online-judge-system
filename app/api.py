@@ -263,6 +263,12 @@ async def update_user_role(
     user = await session.get(User, parsed_id)
     if user is None:
         raise ApiError(404, "user not found")
+    if user.role == "admin" and payload.role != "admin":
+        admin_count = int(
+            await session.scalar(select(func.count(User.id)).where(User.role == "admin")) or 0
+        )
+        if admin_count <= 1:
+            raise ApiError(409, "at least one admin is required")
     user.role = payload.role
     await session.commit()
     return success({"user_id": str(user.id), "role": user.role}, "role updated")

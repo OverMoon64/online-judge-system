@@ -45,6 +45,18 @@ async def test_registration_login_roles_and_statistics(client: httpx.AsyncClient
     assert (await login(client, "alice")).status_code == 403
 
 
+async def test_last_admin_cannot_remove_own_admin_access(client: httpx.AsyncClient) -> None:
+    await login(client)
+    response = await client.put("/api/users/1/role", json={"role": "banned"})
+    assert response.status_code == 409
+    assert response.json() == {
+        "code": 409,
+        "msg": "at least one admin is required",
+        "data": None,
+    }
+    assert (await client.get("/api/users/")).status_code == 200
+
+
 async def test_change_password_requires_owner_and_current_password(
     client: httpx.AsyncClient,
 ) -> None:
