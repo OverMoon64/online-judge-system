@@ -205,18 +205,6 @@ def resource_limit_summary(validation: dict[str, Any]) -> str | None:
     return f"{summary} · {reasons}" if reasons else summary
 
 
-def complexity_validation_summary(validation: dict[str, Any]) -> str | None:
-    complexity = validation.get("complexity_validation") or {}
-    if not complexity.get("passed"):
-        return None
-    stress_count = len(complexity.get("stress_testcase_indexes") or [])
-    rejected = int(complexity.get("rejected_stress_cases", 0) or 0)
-    return (
-        f"复杂度压力验证通过：本地生成 {stress_count} 个大规模隐藏点，"
-        f"低效但正确的探针解在 {rejected} 个压力点被 TLE/MLE 淘汰。"
-    )
-
-
 def compact_preview(value: str, limit: int = 2_000) -> str:
     if len(value) <= limit:
         return value
@@ -1035,7 +1023,7 @@ def live_ai_task_panel() -> None:
             if cancelled.get("code") == 200:
                 st.warning("任务已中断")
     elif data["status"] == "completed":
-        st.success("AI 命题已完成并通过自动校验")
+        st.success("AI 命题已完成")
         result = data["result"]
         problem = result.get("problem", {})
         validation = result.get("validation") or {}
@@ -1044,58 +1032,11 @@ def live_ai_task_panel() -> None:
             st.caption(resource_summary)
         id_assignment = validation.get("id_assignment") or {}
         if id_assignment.get("source") == "automatic":
-            st.caption(
-                f"系统顺序编号：{id_assignment.get('final_id', '—')}"
-                f"（模型原编号：{id_assignment.get('model_id', '—')}）"
-            )
-        complexity_summary = complexity_validation_summary(validation)
-        if complexity_summary:
-            st.success(complexity_summary)
-            complexity = validation.get("complexity_validation") or {}
-            contract = result.get("complexity_contract") or {}
-            with st.expander("查看复杂度压力验证明细"):
-                st.markdown(
-                    f"**目标复杂度：** {contract.get('expected_time_complexity') or '—'}；"
-                    f"**空间复杂度：** {contract.get('expected_space_complexity') or '—'}"
-                )
-                st.caption(
-                    "需要淘汰："
-                    + "、".join(contract.get("forbidden_time_complexities") or ["未填写"])
-                )
-                st.write(contract.get("stress_rationale") or "未填写压力规模依据。")
-                stress_rows = [
-                    {
-                        "压力点": item.get("label", "—"),
-                        "规模": item.get("scale", "—"),
-                        "输入字节": item.get("input_bytes", 0),
-                    }
-                    for item in complexity.get("items") or []
-                ]
-                if stress_rows:
-                    st.dataframe(stress_rows, hide_index=True, width="stretch")
-                probe_rows = [
-                    {
-                        "类型": {
-                            "sample": "小样例",
-                            "ordinary": "普通点",
-                            "stress": "压力点",
-                        }.get(item.get("kind"), "—"),
-                        "序号": item.get("index", "—"),
-                        "结果": item.get("status", "—"),
-                        "时间(s)": item.get("time", 0),
-                        "内存(MB)": item.get("memory", 0),
-                    }
-                    for item in complexity.get("probe_results") or []
-                ]
-                if probe_rows:
-                    st.dataframe(probe_rows, hide_index=True, width="stretch")
+            st.caption(f"题目编号：{id_assignment.get('final_id', '—')}")
         calibration = validation.get("output_calibration") or {}
         if calibration.get("applied"):
             calibration_count = int(calibration.get("count", 0) or 0)
-            st.info(
-                f"Python/C++ 一致输出已校准 {calibration_count} 个答案；"
-                "下方可核对修改前后内容，导入时采用校准答案。"
-            )
+            st.info(f"Python/C++ 已校准 {calibration_count} 个答案。")
             with st.expander("查看答案校准明细"):
                 st.dataframe(
                     output_calibration_rows(validation),
@@ -1156,7 +1097,6 @@ def page_ai() -> None:
     if not require_login():
         return
     st.header("AI 智能命题")
-    st.caption("先选择已配置模型进行命题；API Key 加密保存在本机，不进入数据库、日志或响应。")
     configs_result = api_call("GET", "/api/ai/model-configs/", quiet=True)
     configured_models = (
         configs_result.get("data", {}).get("models", [])
@@ -1167,7 +1107,7 @@ def page_ai() -> None:
 
     with task_tab:
         if not configured_models:
-            st.warning("尚未配置模型，请先切换到“模型配置”添加 OpenAI-compatible 模型。")
+            st.warning("请先在“模型配置”中添加模型。")
         problem_result = api_call("GET", "/api/problems/", quiet=True)
         existing_ids = [item["id"] for item in problem_result.get("data") or []]
         with st.form("ai_task"):
@@ -1188,15 +1128,14 @@ def page_ai() -> None:
             requirement = st.text_area(
                 "命题需求 *",
                 height=150,
-                placeholder="例如：设计一道考查滑动窗口的中等难度题，避免套用经典题面……",
+                placeholder="描述知识点、题型和特殊要求",
             )
             knowledge_text = st.text_input("知识点（逗号分隔）")
             left, right = st.columns(2)
-            difficulty = left.selectbox("预期难度", ["入门", "简单", "中等", "困难"])
+            difficulty = left.selectbox("预期难度", ["自动", "入门", "简单", "中等", "困难"])
             testcase_choice = right.selectbox(
                 "隐藏测试点策略",
                 ["自动"] + list(range(2, 11)),
-                help="自动模式由模型结合算法复杂度、边界规模和预计运行时长生成 2–10 个测试点。",
             )
             problem_id = st.selectbox("参考/修改已有题目（可选）", [""] + existing_ids)
             submitted = st.form_submit_button(
@@ -1279,7 +1218,7 @@ def page_ai() -> None:
             )
             currency = st.text_input("币种", value="CNY", key="ai_config_currency")
             disable_thinking = st.checkbox(
-                "对支持的 Qwen 模型关闭思考模式（推荐，可显著减少输出 Token）",
+                "关闭 Qwen 思考模式",
                 value=True,
                 key="ai_config_disable_thinking",
             )
