@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from types import SimpleNamespace
@@ -9,6 +10,12 @@ import pytest
 
 from app import ai_service, judge
 from app.schemas import AIModelConfigPayload, LanguagePayload, ProblemPayload
+from app.testcase_files import (
+    configure_testcase_store,
+    load_file_testcases,
+    remove_file_testcases,
+    write_file_testcases,
+)
 
 
 def _config() -> AIModelConfigPayload:
@@ -354,3 +361,30 @@ async def test_private_ai_provider_rules(monkeypatch: pytest.MonkeyPatch, tmp_pa
 def test_process_memory_probe_handles_missing_process() -> None:
     assert judge._rss_tree_mb(os.getpid()) > 0
     assert judge._rss_tree_mb(999_999_999) == 0
+
+
+async def test_file_testcases_require_matching_problem_fingerprint_and_checksum(tmp_path) -> None:
+    configure_testcase_store(tmp_path / "file-cases")
+    problem = _problem()
+    try:
+        manifest = await write_file_testcases(
+            problem,
+            [{"label": "最大边界", "input": "999\n", "output": "999\n"}],
+            metadata={"template": "bounded_integer"},
+        )
+        loaded = await load_file_testcases(problem)
+        assert loaded[0]["input"] == "999\n"
+        assert loaded[0]["output_file"].endswith(".out")
+
+        changed = problem.model_copy(update={"constraints": "1 <= n <= 10"})
+        assert await load_file_testcases(changed) == []
+
+        key = hashlib.sha256(problem.id.encode()).hexdigest()
+        input_path = tmp_path / "file-cases" / key / manifest["cases"][0]["input_file"]
+        input_path.write_text("tampered\n", encoding="utf-8")
+        assert await load_file_testcases(problem) == []
+
+        await remove_file_testcases(problem.id)
+        assert not input_path.parent.exists()
+    finally:
+        configure_testcase_store(None)

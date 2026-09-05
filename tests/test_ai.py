@@ -8,7 +8,9 @@ import pytest
 from pydantic import ValidationError
 
 from app import ai_service, judge
-from app.schemas import AIModelConfigPayload, AIProblemTaskPayload, GeneratedProblem
+from app.schemas import AIModelConfigPayload, AIProblemTaskPayload, GeneratedProblem, ProblemPayload
+from app.stress_cases import infer_stress_candidate
+from app.testcase_files import load_file_testcases
 from tests.conftest import login
 
 
@@ -165,12 +167,18 @@ def fibonacci_payload() -> dict:
 
 
 async def _wait_task(client: httpx.AsyncClient, task_id: str) -> dict:
+    last_response = ""
     for _ in range(200):
-        data = (await client.get(f"/api/ai/problem-tasks/{task_id}")).json()["data"]
+        response = await client.get(f"/api/ai/problem-tasks/{task_id}")
+        last_response = f"{response.status_code}: {response.text[:500]}"
+        if response.status_code != 200:
+            await asyncio.sleep(0.02)
+            continue
+        data = response.json()["data"]
         if data["status"] not in {"pending", "running"}:
             return data
         await asyncio.sleep(0.02)
-    raise AssertionError("AI task did not finish")
+    raise AssertionError(f"AI task did not finish; last response: {last_response}")
 
 
 async def test_ai_config_generation_usage_and_secret_masking(
@@ -238,6 +246,11 @@ async def test_ai_config_generation_usage_and_secret_masking(
     assert task["status"] == "completed", task
     assert task["result"]["validation"]["passed"] is True
     assert task["result"]["validation"]["reference_languages"] == ["python", "cpp"]
+    assert task["result"]["validation"]["file_stress"] == {
+        "requested": False,
+        "applied": False,
+        "count": 0,
+    }
     assert task["usage"]["input_tokens"] == 200
     assert task["usage"]["output_tokens"] == 100
     assert task["usage"]["cost"] == 0.0012
@@ -788,3 +801,230 @@ async def test_ai_task_is_private_to_creator(client: httpx.AsyncClient, monkeypa
     await client.post("/api/auth/logout")
     await login(client)
     assert (await client.put(f"/api/ai/problem-tasks/{task_id}/cancel")).status_code == 200
+
+
+def stress_array_payload() -> dict:
+    payload = generated_payload()
+    payload["problem"].update(
+        {
+            "title": "大规模数组求和",
+            "description": "输入 n 个整数，输出所有整数之和。",
+            "input_description": "第一行 n，第二行 n 个整数。",
+            "constraints": "1 <= n <= 50000，每个整数绝对值不超过 10^9。",
+            "samples": [{"input": "3\n1 2 3\n", "output": "6\n"}],
+            "testcases": [
+                {"input": "1\n5\n", "output": "5\n"},
+                {"input": "4\n1 2 3 4\n", "output": "10\n"},
+                {"input": "5\n-2 -1 0 1 2\n", "output": "0\n"},
+            ],
+            "tags": ["数组", "复杂度"],
+            "difficulty": "困难",
+        }
+    )
+    payload["reference_solution"] = (
+        "import sys\n"
+        "data=list(map(int,sys.stdin.buffer.read().split()))\n"
+        "print(sum(data[1:1+data[0]]))\n"
+    )
+    payload["reference_solution_cpp"] = (
+        "#include <iostream>\nusing namespace std;\n"
+        "int main(){ios::sync_with_stdio(false);cin.tie(nullptr);"
+        "int n;if(!(cin>>n))return 0;long long s=0,x;"
+        "while(n--&&cin>>x)s+=x;cout<<s;}\n"
+    )
+    payload["solution_explanation"] = "线性扫描数组，时间复杂度 O(n)，空间复杂度 O(1)。"
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("title", "sample_input", "constraints", "tags", "expected_template"),
+    [
+        (
+            "字符串回文统计",
+            "abba\n",
+            "1 <= |S| <= 10000",
+            ["字符串", "回文"],
+            "single_string",
+        ),
+        (
+            "网格路径",
+            "2 2\n0 1\n1 0\n",
+            "1 <= n <= 100，1 <= m <= 100",
+            ["网格", "动态规划"],
+            "integer_grid",
+        ),
+        (
+            "图的连通性",
+            "3 2\n1 2\n2 3\n",
+            "1 <= n <= 5000，0 <= m <= 10000",
+            ["图", "并查集"],
+            "graph_chain",
+        ),
+    ],
+)
+def test_file_stress_templates_are_inferred_without_model_code(
+    title: str,
+    sample_input: str,
+    constraints: str,
+    tags: list[str],
+    expected_template: str,
+) -> None:
+    payload = generated_payload()
+    payload["problem"].update(
+        {
+            "title": title,
+            "description": title,
+            "input_description": title,
+            "constraints": constraints,
+            "samples": [{"input": sample_input, "output": "0\n"}],
+            "tags": tags,
+        }
+    )
+    generated = GeneratedProblem.model_validate(payload)
+    request = AIProblemTaskPayload(requirement="使用大数据压力测试严格验证时间复杂度")
+
+    candidate = infer_stress_candidate(generated, request)
+
+    assert candidate is not None
+    assert candidate.template == expected_template
+    assert len(candidate.input) > len(sample_input)
+
+
+def test_fibonacci_file_stress_uses_declared_integer_boundary() -> None:
+    generated = GeneratedProblem.model_validate(fibonacci_payload())
+    request = AIProblemTaskPayload(requirement="使用最大规模数据严格验证递推算法的时间复杂度")
+
+    candidate = infer_stress_candidate(generated, request)
+
+    assert candidate is not None
+    assert candidate.template == "bounded_integer"
+    assert candidate.input == "100000\n"
+    assert candidate.scale == {"n": 100000}
+
+
+async def test_ai_file_stress_is_optional_and_used_by_judge(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await login(client)
+    await client.put(
+        "/api/ai/model-config",
+        json={
+            "provider_url": "https://example-model-provider.test/v1",
+            "model": "file-stress-model",
+            "api_key": "secret",
+        },
+    )
+    payload = stress_array_payload()
+    calls = 0
+
+    async def fake_provider(*_args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if not kwargs.get("json_mode"):
+            return "采用线性扫描并用最大规模数组淘汰平方复杂度算法", {
+                "input_tokens": 5,
+                "output_tokens": 5,
+            }
+        return json.dumps(payload, ensure_ascii=False), {
+            "input_tokens": 10,
+            "output_tokens": 20,
+        }
+
+    monkeypatch.setattr(ai_service, "_provider_request", fake_provider)
+    response = await client.post(
+        "/api/ai/problem-tasks/",
+        json={
+            "requirement": (
+                "生成数组求和题，用最大规模大数据严格测试复杂度，"
+                "时间限制 0.5 秒，确保额外校验失败不影响普通题生成"
+            ),
+            "difficulty": "困难",
+            "testcase_count": 3,
+        },
+    )
+    task = await _wait_task(client, response.json()["data"]["task_id"])
+
+    assert task["status"] == "completed", task
+    assert calls == 2
+    file_stress = task["result"]["validation"]["file_stress"]
+    assert file_stress["applied"] is True
+    assert file_stress["template"] == "counted_integer_array"
+    assert file_stress["count"] == 1
+    assert file_stress["input_bytes"] > 50_000
+
+    problem_data = task["result"]["problem"]
+    problem = ProblemPayload.model_validate(problem_data)
+    file_cases = await load_file_testcases(problem)
+    assert len(file_cases) == 1
+    assert file_cases[0]["input_file"].endswith(".in")
+    assert file_cases[0]["output_file"].endswith(".out")
+
+    assert (await client.post("/api/problems/", json=problem_data)).status_code == 200
+    detail = (await client.get(f"/api/problems/{problem.id}")).json()["data"]
+    assert detail["file_testcase_count"] == 1
+
+    submitted = await client.post(
+        "/api/submissions/",
+        json={
+            "problem_id": problem.id,
+            "language": "python",
+            "code": (
+                "import sys\n"
+                "d=list(map(int,sys.stdin.buffer.read().split()));n=d[0];a=d[1:]\n"
+                "for _ in range(n):\n"
+                "    for __ in range(n):\n"
+                "        pass\n"
+                "print(sum(a))\n"
+            ),
+        },
+    )
+    submission_id = int(submitted.json()["data"]["submission_id"])
+    await judge.wait_for_submission(submission_id, timeout=10)
+    judged = (await client.get(f"/api/submissions/{submission_id}")).json()["data"]
+    assert judged["result"] == "TLE"
+    assert judged["counts"] == 40
+    log = (await client.get(f"/api/submissions/{submission_id}/log")).json()["data"]
+    assert log["details"][-1]["source"] == "file"
+
+    assert (await client.delete(f"/api/problems/{problem.id}")).status_code == 200
+    assert await load_file_testcases(problem) == []
+
+
+async def test_unsupported_file_stress_never_fails_ai_task(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await login(client)
+    await client.put(
+        "/api/ai/model-config",
+        json={
+            "provider_url": "https://example-model-provider.test/v1",
+            "model": "fallback-model",
+            "api_key": "secret",
+        },
+    )
+    calls = 0
+
+    async def fake_provider(*_args, **kwargs):
+        nonlocal calls
+        calls += 1
+        content = "复杂度分析" if not kwargs.get("json_mode") else json.dumps(generated_payload())
+        return content, {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ai_service, "_provider_request", fake_provider)
+    response = await client.post(
+        "/api/ai/problem-tasks/",
+        json={
+            "requirement": "生成三整数输入题并尝试大数据复杂度验证，无法识别时必须正常完成",
+            "testcase_count": 3,
+        },
+    )
+    task = await _wait_task(client, response.json()["data"]["task_id"])
+
+    assert task["status"] == "completed", task
+    assert calls == 2
+    assert task["result"]["validation"]["file_stress"] == {
+        "requested": True,
+        "applied": False,
+        "count": 0,
+        "reason": "未能安全识别受支持的输入结构",
+    }

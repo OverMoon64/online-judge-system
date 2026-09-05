@@ -9,6 +9,7 @@ from app import ai_service
 from app.db import configure_database, initialize_database
 from app.judge import cancel_all_submission_tasks
 from app.main import app
+from app.testcase_files import clear_testcase_store, configure_testcase_store
 
 
 @pytest_asyncio.fixture
@@ -16,6 +17,8 @@ async def client(tmp_path) -> AsyncIterator[httpx.AsyncClient]:
     await cancel_all_submission_tasks()
     await ai_service.cancel_all_ai_tasks(clear_configs=True)
     await ai_service.configure_model_store(tmp_path / "ai-model-configs.enc")
+    configure_testcase_store(tmp_path / "testcases")
+    await clear_testcase_store()
     database_file = tmp_path / "test.db"
     await configure_database(f"sqlite+aiosqlite:///{database_file}")
     await initialize_database()
@@ -26,6 +29,8 @@ async def client(tmp_path) -> AsyncIterator[httpx.AsyncClient]:
         yield test_client
     await cancel_all_submission_tasks()
     await ai_service.cancel_all_ai_tasks(clear_configs=True)
+    await clear_testcase_store()
+    configure_testcase_store(None)
 
 
 async def login(
