@@ -127,15 +127,8 @@ class AIProblemTaskPayload(StrictModel):
     problem_id: str | None = Field(default=None, min_length=1, max_length=80)
     model_config_name: str | None = Field(default=None, min_length=1, max_length=60)
     knowledge_points: list[str] = Field(default_factory=list, max_length=20)
-    difficulty: str = Field(default="中等", max_length=40)
+    difficulty: Literal["自动", "入门", "简单", "中等", "困难"] = "自动"
     testcase_count: int | None = Field(default=None, ge=2, le=10)
-
-
-class ComplexityContract(StrictModel):
-    expected_time_complexity: str = ""
-    expected_space_complexity: str = ""
-    forbidden_time_complexities: list[str] = Field(default_factory=list, max_length=10)
-    stress_rationale: str = ""
 
 
 class GeneratedProblem(StrictModel):
@@ -143,6 +136,3 @@ class GeneratedProblem(StrictModel):
     reference_solution: str = Field(min_length=1)
     reference_solution_cpp: str = Field(min_length=1)
     solution_explanation: str = ""
-    stress_test_generator: str = ""
-    complexity_probe_solution: str = ""
-    complexity_contract: ComplexityContract = Field(default_factory=ComplexityContract)
