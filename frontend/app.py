@@ -515,7 +515,10 @@ def render_problem_statement(
         limit_columns = st.columns(4 if attempts is not None else 3)
         limit_columns[0].metric("时间限制", f"{data['time_limit']} s")
         limit_columns[1].metric("内存限制", f"{data['memory_limit']} MB")
-        limit_columns[2].metric("测试点", len(data.get("testcases") or []))
+        testcase_count = len(data.get("testcases") or []) + int(
+            data.get("file_testcase_count", 0) or 0
+        )
+        limit_columns[2].metric("测试点", testcase_count)
         if attempts is not None:
             limit_columns[3].metric("个人提交", attempts)
 
@@ -715,6 +718,8 @@ def render_submission_log(data: dict[str, Any]) -> None:
         with st.container(border=True):
             case_col, result_col, time_col, memory_col = st.columns([1.2, 1, 1, 1])
             case_col.markdown(f"**测试点 #{case.get('id', '—')}**")
+            if case.get("source") == "file":
+                case_col.caption("文件压力点")
             result_col.markdown(
                 status_badge(str(case.get("result", "UNK"))), unsafe_allow_html=True
             )
@@ -1048,11 +1053,20 @@ def live_ai_task_panel() -> None:
                         "校准答案": st.column_config.TextColumn(width="medium"),
                     },
                 )
+        file_stress = validation.get("file_stress") or {}
+        if file_stress.get("applied"):
+            st.info(
+                f"已生成 {file_stress.get('count', 0)} 个文件压力点 · "
+                f"{file_stress.get('label', '压力测试')} · "
+                f"{file_stress.get('input_bytes', 0) / 1024:.1f} KiB"
+            )
+        elif file_stress.get("requested"):
+            st.caption(f"文件压力点未启用：{file_stress.get('reason', '未通过安全校验')}")
         with st.container(border=True):
             st.subheader(f"{problem.get('id', '—')} · {problem.get('title', '未命名题目')}")
             st.caption(
                 f"难度：{problem.get('difficulty') or '未标注'} · "
-                f"测试点：{len(problem.get('testcases') or [])} · "
+                f"测试点：{len(problem.get('testcases') or []) + int(file_stress.get('count', 0) or 0)} · "
                 f"时间：{problem.get('time_limit', '—')} s · "
                 f"内存：{problem.get('memory_limit', '—')} MB"
             )
