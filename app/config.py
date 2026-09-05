@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     compile_timeout_seconds: float = 15.0
     allowed_executables: str = "python,python3,g++,gcc,clang,clang++,java,javac,node,ruby,go"
     ai_config_file: str = "./data/ai-model-configs.enc"
+    testcase_dir: str = "./data/testcases"
 
     model_config = SettingsConfigDict(
         env_prefix="OJ_",
