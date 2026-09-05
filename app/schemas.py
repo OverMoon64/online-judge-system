@@ -129,6 +129,7 @@ class AIProblemTaskPayload(StrictModel):
     knowledge_points: list[str] = Field(default_factory=list, max_length=20)
     difficulty: Literal["自动", "入门", "简单", "中等", "困难"] = "自动"
     testcase_count: int | None = Field(default=None, ge=2, le=10)
+    reasoning_effort: Literal["auto", "low", "medium", "high", "max"] = "auto"
 
 
 class GeneratedProblem(StrictModel):

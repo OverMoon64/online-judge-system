@@ -234,27 +234,73 @@ def _completion_endpoint(base_url: str) -> str:
     return base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
 
 
+def _reasoning_request_options(
+    config: AIModelConfigPayload, reasoning_effort: str
+) -> dict[str, Any]:
+    host = (urlparse(config.provider_url).hostname or "").lower()
+    model = config.model.lower()
+    is_dashscope = "aliyuncs.com" in host
+    if reasoning_effort == "auto":
+        if is_dashscope and model.startswith("qwen") and config.disable_thinking:
+            return {"enable_thinking": False}
+        return {}
+
+    budgets = {"low": 4096, "medium": 8192, "high": 16_384, "max": 32_768}
+    if is_dashscope and model.startswith("qwen"):
+        if model.startswith("qwen3.8"):
+            mapped = {"low": "low", "medium": "medium", "high": "xhigh", "max": "xhigh"}
+            return {"reasoning_effort": mapped[reasoning_effort]}
+        return {
+            "enable_thinking": True,
+            "thinking_budget": budgets[reasoning_effort],
+        }
+    if is_dashscope and model.startswith("kimi"):
+        if model.startswith("kimi-k3"):
+            mapped = {"low": "low", "medium": "high", "high": "high", "max": "max"}
+            return {"reasoning_effort": mapped[reasoning_effort]}
+        return {
+            "enable_thinking": True,
+            "thinking_budget": budgets[reasoning_effort],
+        }
+    if is_dashscope and model.startswith("deepseek"):
+        mapped = {"low": "low", "medium": "high", "high": "high", "max": "max"}
+        return {
+            "enable_thinking": True,
+            "reasoning_effort": mapped[reasoning_effort],
+        }
+    if model.startswith("kimi") and ("moonshot.cn" in host or "moonshot.ai" in host):
+        return {"thinking": {"type": "disabled" if reasoning_effort == "low" else "enabled"}}
+    if model.startswith("deepseek") or "deepseek.com" in host:
+        mapped = {"low": "low", "medium": "high", "high": "high", "max": "max"}
+        return {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": mapped[reasoning_effort],
+        }
+    return {"reasoning_effort": reasoning_effort}
+
+
 async def _provider_request(
     config: AIModelConfigPayload,
     messages: list[dict[str, str]],
     *,
     on_delta: StreamCallback | None = None,
     json_mode: bool = False,
+    reasoning_effort: str = "auto",
 ) -> tuple[str, dict[str, Any]]:
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     payload = {
         "model": config.model,
         "messages": messages,
-        "temperature": 0.35,
     }
+    reasoning_options = _reasoning_request_options(config, reasoning_effort)
+    payload.update(reasoning_options)
     provider_host = (urlparse(config.provider_url).hostname or "").lower()
     is_dashscope_qwen = config.model.lower().startswith("qwen") and (
         "aliyuncs.com" in provider_host
     )
     if is_dashscope_qwen:
+        payload["temperature"] = 0.35
         payload["max_completion_tokens"] = 12_000
-        if config.disable_thinking:
-            payload["enable_thinking"] = False
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
     try:
@@ -277,8 +323,23 @@ async def _provider_request(
                     if exc.response.status_code not in {400, 404, 422}:
                         raise
                     fallback = await client.post(endpoint, headers=headers, json=payload)
+                    reasoning_fallback = False
+                    if fallback.status_code in {400, 422} and reasoning_options:
+                        compatible_payload = {
+                            key: value
+                            for key, value in payload.items()
+                            if key not in reasoning_options
+                        }
+                        fallback = await client.post(
+                            endpoint,
+                            headers=headers,
+                            json=compatible_payload,
+                        )
+                        reasoning_fallback = True
                     fallback.raise_for_status()
                     content, usage = _parse_non_stream_response(fallback.json())
+                    if reasoning_fallback:
+                        usage["reasoning_fallback"] = True
                     if on_delta:
                         await on_delta(content)
                     return content, usage
@@ -300,6 +361,7 @@ async def _provider_request_with_retry(
     retry_count: int = 2,
     on_delta: StreamCallback | None = None,
     json_mode: bool = False,
+    reasoning_effort: str = "auto",
 ) -> tuple[str, dict[str, Any]]:
     for attempt in range(retry_count + 1):
         try:
@@ -308,6 +370,7 @@ async def _provider_request_with_retry(
                 messages,
                 on_delta=on_delta,
                 json_mode=json_mode,
+                reasoning_effort=reasoning_effort,
             )
             usage = dict(usage)
             usage["request_count"] = attempt + 1
@@ -337,8 +400,12 @@ def _token_usage(value: dict[str, Any] | None) -> dict[str, Any]:
             usage.get("total_tokens", usage.get("total_token_count", input_tokens + output_tokens))
             or 0
         ),
-        "cached_input_tokens": int(input_details.get("cached_tokens", 0) or 0),
-        "reasoning_tokens": int(output_details.get("reasoning_tokens", 0) or 0),
+        "cached_input_tokens": int(
+            usage.get("cached_tokens", input_details.get("cached_tokens", 0)) or 0
+        ),
+        "reasoning_tokens": int(
+            usage.get("reasoning_tokens", output_details.get("reasoning_tokens", 0)) or 0
+        ),
         "request_count": 1,
         "estimated": not bool(value),
     }
@@ -457,6 +524,8 @@ def _merge_usage(
     total["estimated"] = (
         bool(total.get("estimated")) or bool(current.get("estimated")) or total["total_tokens"] == 0
     )
+    if current.get("reasoning_fallback"):
+        total["reasoning_fallback"] = True
     if current.get("unreported_attempts"):
         total["unreported_attempts"] = int(total.get("unreported_attempts", 0)) + int(
             current["unreported_attempts"]
@@ -475,6 +544,7 @@ def _merge_stage_usage(
             "reasoning_tokens": int(current.get("reasoning_tokens", 0) or 0),
             "request_count": int(current.get("request_count", 1) or 1),
             "finish_reason": current.get("finish_reason"),
+            "reasoning_fallback": bool(current.get("reasoning_fallback")),
         }
     )
 
@@ -852,6 +922,13 @@ def _generation_prompt(
         if request.difficulty == "自动"
         else f"difficulty 必须填写 {request.difficulty}。"
     )
+    file_stress_instruction = ""
+    if stress_requested(request):
+        file_stress_instruction = (
+            "本需求要求大数据或复杂度验证。若题意适合，请优先采用系统可识别的单实例输入："
+            "单个整数 N、第一行 N 第二行 N 个整数、单个字符串、N×M 整数网格，或第一行 N M "
+            "后接 M 条边；constraints 必须明确写出 N/M/字符串长度的数值上限，样例不得省略数据。"
+        )
     return f"""
 你是程序设计训练课程的严谨命题专家。请根据命题需求和分析草案生成一道可直接导入 OJ 的题目。
 
@@ -860,6 +937,8 @@ def _generation_prompt(
 难度：{request.difficulty}。{difficulty_instruction}
 {testcase_requirement}，覆盖最小值、最大值、特殊结构和能区分错误算法的数据。
 资源限制：{resource_requirement}
+推理强度偏好：{request.reasoning_effort}
+{file_stress_instruction}
 参考已有题目：{existing_text}
 分析草案：{blueprint}
 
@@ -1134,7 +1213,14 @@ async def _run_problem_task(
     config_name: str,
 ) -> None:
     usage = _empty_usage(config)
-    usage.update({"model_config_name": config_name, "model": config.model, "calls": []})
+    usage.update(
+        {
+            "model_config_name": config_name,
+            "model": config.model,
+            "reasoning_effort": request.reasoning_effort,
+            "calls": [],
+        }
+    )
     staged_file_problem_id: str | None = None
     try:
         existing: dict[str, Any] | None = None
@@ -1157,7 +1243,8 @@ async def _run_problem_task(
             "预期算法、复杂度、边界条件和用于淘汰错误/低效算法的测试策略。\n"
             f"需求：{request.requirement}\n难度：{request.difficulty}\n"
             f"知识点：{request.knowledge_points}\n"
-            f"测试点策略：{request.testcase_count or '按复杂度和运行时长自动决定 2-10 个'}"
+            f"测试点策略：{request.testcase_count or '按复杂度和运行时长自动决定 2-10 个'}\n"
+            f"推理强度偏好：{request.reasoning_effort}"
         )
         blueprint, current_usage = await _provider_request_with_retry(
             config,
@@ -1166,6 +1253,7 @@ async def _run_problem_task(
                 {"role": "user", "content": analysis_prompt},
             ],
             on_delta=_stream_preview_callback(task_id, "需求分析"),
+            reasoning_effort=request.reasoning_effort,
         )
         _merge_stage_usage(usage, current_usage, config, "需求分析")
         await _record_model_usage(user_id, config_name, current_usage, config)
@@ -1185,6 +1273,7 @@ async def _run_problem_task(
             ],
             on_delta=_stream_preview_callback(task_id, "题面、解法与测试点"),
             json_mode=True,
+            reasoning_effort=request.reasoning_effort,
         )
         _merge_stage_usage(usage, current_usage, config, "题面、解法与测试点")
         await _record_model_usage(user_id, config_name, current_usage, config)
@@ -1278,6 +1367,7 @@ async def _run_problem_task(
                 ],
                 on_delta=_stream_preview_callback(task_id, repair_stage),
                 json_mode=True,
+                reasoning_effort=request.reasoning_effort,
             )
             _merge_stage_usage(usage, current_usage, config, repair_stage)
             await _record_model_usage(user_id, config_name, current_usage, config)
@@ -1423,6 +1513,7 @@ async def create_problem_task(user_id: int, request: AIProblemTaskPayload) -> AI
             **_empty_usage(config),
             "model_config_name": config_name,
             "model": config.model,
+            "reasoning_effort": request.reasoning_effort,
         },
     )
     async with database.session_factory() as session:
