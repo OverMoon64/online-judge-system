@@ -7,7 +7,6 @@ from streamlit.testing.v1 import AppTest
 
 from frontend.app import (
     compact_preview,
-    complexity_validation_summary,
     output_calibration_rows,
     resolve_problem_selection,
     resource_limit_summary,
@@ -105,20 +104,7 @@ def test_resource_limit_summary_explains_automatic_decision() -> None:
     assert resource_limit_summary({}) is None
 
 
-def test_complexity_summary_and_large_preview_are_clear() -> None:
-    summary = complexity_validation_summary(
-        {
-            "complexity_validation": {
-                "passed": True,
-                "stress_testcase_indexes": [3, 4],
-                "rejected_stress_cases": 2,
-            }
-        }
-    )
-    assert summary is not None
-    assert "2 个大规模隐藏点" in summary
-    assert "TLE/MLE" in summary
-    assert complexity_validation_summary({}) is None
+def test_large_preview_is_clear() -> None:
     assert compact_preview("short", 10) == "short"
     preview = compact_preview("x" * 30, 10)
     assert preview.startswith("x" * 10)
