@@ -10,8 +10,6 @@ import streamlit as st
 from code_editor import code_editor
 from streamlit_cookies_manager import EncryptedCookieManager
 
-from app.config import get_settings
-
 try:
     from frontend.api_client import (
         clear_client_cookies,
@@ -21,6 +19,7 @@ try:
         request_json,
     )
     from frontend.browser_session import (
+        browser_cookie_password,
         clear_browser_session,
         load_browser_session,
         restore_backend_session,
@@ -36,6 +35,7 @@ except ModuleNotFoundError:  # Streamlit executes this file with frontend/ on sy
         request_json,
     )
     from browser_session import (  # type: ignore[no-redef]
+        browser_cookie_password,
         clear_browser_session,
         load_browser_session,
         restore_backend_session,
@@ -216,7 +216,7 @@ def initialize_browser_session() -> None:
     try:
         store = EncryptedCookieManager(
             prefix="online-judge/",
-            password=get_settings().session_secret,
+            password=browser_cookie_password(),
         )
     except Exception:
         st.session_state["_browser_cookie_store"] = None

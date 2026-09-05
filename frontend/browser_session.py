@@ -1,12 +1,31 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_COOKIE_NAME = "oj_session"
 BROWSER_COOKIE_KEY = "backend_session"
+
+
+class BrowserSessionSettings(BaseSettings):
+    session_secret: str = "development-only-change-this-secret"
+
+    model_config = SettingsConfigDict(
+        env_prefix="OJ_",
+        env_file=Path(__file__).resolve().parents[1] / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+@lru_cache
+def browser_cookie_password() -> str:
+    return BrowserSessionSettings().session_secret
 
 
 class BrowserCookieStore(Protocol):
