@@ -56,6 +56,61 @@ STATUS_STYLES = {
     "200": ("#067647", "#ecfdf3"),
     "403": ("#b42318", "#fef3f2"),
 }
+REASONING_LABELS = {
+    "auto": "自动（提供商默认）",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "max": "最高",
+}
+MODEL_COMPATIBILITY = [
+    {
+        "提供商": "阿里云百炼 / Qwen",
+        "Base URL 示例": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "模型示例": "qwen3.7-plus、qwen3.7-flash",
+        "推理控制": "thinking_budget / reasoning_effort",
+    },
+    {
+        "提供商": "DeepSeek",
+        "Base URL 示例": "https://api.deepseek.com",
+        "模型示例": "deepseek-v4-flash、deepseek-v4-pro",
+        "推理控制": "reasoning_effort",
+    },
+    {
+        "提供商": "Kimi / Moonshot",
+        "Base URL 示例": "https://api.moonshot.cn/v1",
+        "模型示例": "kimi-k2.6、kimi-k2.5",
+        "推理控制": "thinking 开关；档位同时写入提示词",
+    },
+    {
+        "提供商": "其他 OpenAI-compatible",
+        "Base URL 示例": "服务商给出的 /v1 地址",
+        "模型示例": "OpenAI、GLM、OpenRouter、SiliconFlow 等",
+        "推理控制": "reasoning_effort；不支持时自动回退",
+    },
+]
+STRESS_PROMPT_EXAMPLES = [
+    (
+        "单整数边界",
+        "生成斐波那契数列取模题。输入仅一个整数 N，明确约束 0 <= N <= 1000000，"
+        "要求使用最大规模大数据严格验证递推复杂度，并生成 Python 和 C++ 参考解法。",
+    ),
+    (
+        "整数数组",
+        "生成逆序对计数题。输入第一行是 N，第二行是 N 个互不相同的整数，明确约束 "
+        "1 <= N <= 75000；要求用最大规模数组压力测试淘汰 O(N^2) 暴力算法。",
+    ),
+    (
+        "整数网格",
+        "生成整数网格最大路径和题。输入第一行 N M，随后 N 行每行 M 个整数，明确约束 "
+        "1 <= N,M <= 300；要求使用大数据严格验证时间复杂度。",
+    ),
+    (
+        "链式图",
+        "生成无向图连通性题。输入第一行 N M，随后 M 行每行两个端点，明确约束 "
+        "1 <= N <= 30000、0 <= M <= 60000；要求生成最大规模链式图压力测试。",
+    ),
+]
 
 
 def inject_theme() -> None:
@@ -983,7 +1038,11 @@ def live_ai_task_panel() -> None:
     data = response["data"]
     st.progress(data.get("progress_percent", 0), text=data.get("progress", ""))
     usage = data.get("usage") or {}
-    st.caption(f"模型配置：{usage.get('model_config_name', '—')} · 模型：{usage.get('model', '—')}")
+    effort = str(usage.get("reasoning_effort", "auto"))
+    st.caption(
+        f"模型配置：{usage.get('model_config_name', '—')} · 模型：{usage.get('model', '—')} · "
+        f"推理强度：{REASONING_LABELS.get(effort, effort)}"
+    )
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("输入 Token", usage.get("input_tokens", 0))
     col2.metric("输出 Token（含思考）", usage.get("output_tokens", 0))
@@ -1016,6 +1075,8 @@ def live_ai_task_panel() -> None:
             )
     if usage.get("estimated"):
         st.warning("部分请求未返回完整 usage 或发生过重试，Token 与费用为当前可得数据的估算值。")
+    if usage.get("reasoning_fallback"):
+        st.info("该提供商不接受所选推理参数，已自动使用模型默认推理设置，命题流程未中断。")
     if data["status"] in {"pending", "running"}:
         stream_result = data.get("result") or {}
         stream_preview = stream_result.get("stream_preview", "")
@@ -1145,11 +1206,18 @@ def page_ai() -> None:
                 placeholder="描述知识点、题型和特殊要求",
             )
             knowledge_text = st.text_input("知识点（逗号分隔）")
-            left, right = st.columns(2)
-            difficulty = left.selectbox("预期难度", ["自动", "入门", "简单", "中等", "困难"])
-            testcase_choice = right.selectbox(
+            difficulty_col, testcase_col, reasoning_col = st.columns(3)
+            difficulty = difficulty_col.selectbox(
+                "预期难度", ["自动", "入门", "简单", "中等", "困难"]
+            )
+            testcase_choice = testcase_col.selectbox(
                 "隐藏测试点策略",
                 ["自动"] + list(range(2, 11)),
+            )
+            reasoning_effort = reasoning_col.selectbox(
+                "推理强度",
+                list(REASONING_LABELS),
+                format_func=lambda value: REASONING_LABELS[value],
             )
             problem_id = st.selectbox("参考/修改已有题目（可选）", [""] + existing_ids)
             submitted = st.form_submit_button(
@@ -1171,14 +1239,25 @@ def page_ai() -> None:
                         ],
                         "difficulty": difficulty,
                         "testcase_count": (None if testcase_choice == "自动" else testcase_choice),
+                        "reasoning_effort": reasoning_effort,
                     },
                 )
                 if result.get("code") == 200:
                     st.session_state.ai_task_id = result["data"]["task_id"]
                     st.success(f"任务已创建：{result['data']['task_id']}")
+        with st.expander("可复制的文件压力点测试需求"):
+            for title, example in STRESS_PROMPT_EXAMPLES:
+                st.markdown(f"**{title}**")
+                st.code(example, language=None, wrap_lines=True)
         live_ai_task_panel()
 
     with config_tab:
+        with st.expander("兼容模型与填写示例", expanded=not configured_models):
+            st.caption(
+                "支持使用 Bearer API Key 的任意 OpenAI-compatible Chat Completions 服务；"
+                "下列三类有专项推理参数适配。"
+            )
+            st.dataframe(MODEL_COMPATIBILITY, hide_index=True, width="stretch")
         if configured_models:
             st.markdown("#### 已配置模型")
             for item in configured_models:
@@ -1232,7 +1311,7 @@ def page_ai() -> None:
             )
             currency = st.text_input("币种", value="CNY", key="ai_config_currency")
             disable_thinking = st.checkbox(
-                "关闭 Qwen 思考模式",
+                "“自动”推理强度下关闭百炼 Qwen 思考模式",
                 value=True,
                 key="ai_config_disable_thinking",
             )
