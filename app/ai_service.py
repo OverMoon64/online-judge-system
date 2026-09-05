@@ -23,6 +23,8 @@ from app.config import get_settings
 from app.db import AIProblemTask, Problem, utc_now
 from app.judge import ReferenceExecution, execute_reference_solution, normalize_output
 from app.schemas import AIModelConfigPayload, AIProblemTaskPayload, GeneratedProblem
+from app.stress_cases import build_optional_file_stress, stress_requested
+from app.testcase_files import remove_file_testcases
 
 _model_configs: dict[int, dict[str, AIModelConfigPayload]] = {}
 _active_model_configs: dict[int, str] = {}
@@ -1133,6 +1135,7 @@ async def _run_problem_task(
 ) -> None:
     usage = _empty_usage(config)
     usage.update({"model_config_name": config_name, "model": config.model, "calls": []})
+    staged_file_problem_id: str | None = None
     try:
         existing: dict[str, Any] | None = None
         if request.problem_id:
@@ -1305,8 +1308,28 @@ async def _run_problem_task(
         assert generated is not None
         original_problem_id = generated.problem.id
         assigned_problem_id = str(existing["id"]) if existing else await _allocate_ai_problem_id()
+        if existing is None:
+            staged_file_problem_id = assigned_problem_id
         generated.problem.id = assigned_problem_id
         generated.problem.author = config.model
+        file_stress: dict[str, Any] = {
+            "requested": stress_requested(request),
+            "applied": False,
+            "count": 0,
+        }
+        if file_stress["requested"]:
+            await _update_task(
+                task_id,
+                progress="正在尝试生成文件压力测试点",
+                progress_percent=96,
+                usage=usage,
+            )
+            try:
+                file_stress = await asyncio.wait_for(
+                    build_optional_file_stress(generated, request), timeout=20
+                )
+            except TimeoutError:
+                file_stress["reason"] = "文件压力点生成超时，已保留普通测试点"
         result = generated.model_dump(mode="json")
         result["validation"] = {
             "passed": True,
@@ -1318,6 +1341,7 @@ async def _run_problem_task(
             "output_calibration": calibration,
             "resource_limits": resource_limits,
             "difficulty": difficulty_policy,
+            "file_stress": file_stress,
             "id_assignment": {
                 "source": "existing" if existing else "automatic",
                 "model_id": original_problem_id,
@@ -1333,6 +1357,9 @@ async def _run_problem_task(
             result=result,
         )
     except asyncio.CancelledError:
+        if staged_file_problem_id:
+            with contextlib.suppress(Exception):
+                await remove_file_testcases(staged_file_problem_id)
         await _update_task(
             task_id,
             status="cancelled",
@@ -1342,6 +1369,9 @@ async def _run_problem_task(
         )
         raise
     except Exception as exc:
+        if staged_file_problem_id:
+            with contextlib.suppress(Exception):
+                await remove_file_testcases(staged_file_problem_id)
         await _update_task(
             task_id,
             status="failed",
