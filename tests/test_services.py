@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -130,6 +131,23 @@ async def test_process_runner_unknown_runtime_output_limit_and_reference_validat
     assert cpp_compile_error[0].startswith("compile:")
     await judge.cancel_submission_task(99999)
     await judge.cancel_all_submission_tasks()
+
+
+async def test_process_elapsed_excludes_output_cleanup_and_ok_never_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_read = judge._read_limited
+
+    async def delayed_read(stream, limit):
+        output = await original_read(stream, limit)
+        await asyncio.sleep(0.6)
+        return output
+
+    monkeypatch.setattr(judge, "_read_limited", delayed_read)
+    result = await judge.run_process(["python3", "-c", "print('done')"], "", 0.5, 128)
+
+    assert result.status == "OK"
+    assert result.elapsed <= 0.5
 
 
 class _FakeResponse:

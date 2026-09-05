@@ -162,9 +162,11 @@ async def run_process(
     forced_status: str | None = None
     peak_memory = 0.0
 
+    finished_at = started
     try:
         deadline = started + timeout_seconds
-        while process.returncode is None:
+        wait_task = asyncio.create_task(process.wait())
+        while not wait_task.done():
             if stdout_task.done() and isinstance(stdout_task.exception(), OutputLimitExceeded):
                 forced_status = "RE"
                 break
@@ -178,11 +180,19 @@ async def run_process(
             if time.monotonic() >= deadline:
                 forced_status = "TLE"
                 break
-            await asyncio.sleep(0.01)
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(wait_task),
+                    timeout=min(0.01, remaining),
+                )
+            except asyncio.TimeoutError:
+                pass
 
         if forced_status:
             await asyncio.to_thread(_kill_process_tree, process.pid)
-        await process.wait()
+        await wait_task
+        finished_at = time.monotonic()
     except asyncio.CancelledError:
         await asyncio.to_thread(_kill_process_tree, process.pid)
         with contextlib.suppress(Exception):
@@ -204,11 +214,13 @@ async def run_process(
         stderr_bytes = b"output exceeded the configured limit"
         output_error = True
 
-    elapsed = time.monotonic() - started
+    elapsed = finished_at - started
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
     if output_error and not forced_status:
         forced_status = "RE"
+    if not forced_status and elapsed > timeout_seconds:
+        forced_status = "TLE"
     status = forced_status or ("OK" if process.returncode == 0 else "RE")
     return ProcessResult(status, process.returncode or 0, stdout, stderr, elapsed, peak_memory)
 
