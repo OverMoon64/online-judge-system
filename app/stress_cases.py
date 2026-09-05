@@ -40,8 +40,15 @@ def stress_requested(request: AIProblemTaskPayload) -> bool:
     return any(keyword in context for keyword in _request_keywords)
 
 
+def _normalize_constraint_notation(value: str) -> str:
+    normalized = value.replace("\\leq", "<=").replace("\\le", "<=")
+    normalized = normalized.replace("≤", "<=").replace("\\times", "*").replace("×", "*")
+    normalized = normalized.replace("$", "").replace("{", "").replace("}", "")
+    return re.sub(r"(?<=\d)[,，](?=\d)", "", normalized)
+
+
 def _parse_bound_value(value: str) -> int | None:
-    cleaned = re.sub(r"\s+", "", value.lower()).replace("×", "*")
+    cleaned = re.sub(r"\s+", "", _normalize_constraint_notation(value).lower())
     match = re.fullmatch(r"(\d+)\*10(?:\^|\*\*)(\d+)", cleaned)
     if match:
         result = int(match.group(1)) * 10 ** int(match.group(2))
@@ -52,6 +59,7 @@ def _parse_bound_value(value: str) -> int | None:
 
 
 def _upper_bound(constraints: str, variable: str) -> int | None:
+    constraints = _normalize_constraint_notation(constraints)
     escaped = re.escape(variable)
     patterns = (
         rf"(?<![a-z0-9_]){escaped}(?![a-z0-9_])\s*(?:<=|≤)\s*({_bound_value_pattern})",
@@ -68,6 +76,7 @@ def _upper_bound(constraints: str, variable: str) -> int | None:
 
 
 def _string_upper_bound(constraints: str) -> int | None:
+    constraints = _normalize_constraint_notation(constraints)
     patterns = (
         rf"\|\s*[a-z]\s*\|\s*(?:<=|≤)\s*({_bound_value_pattern})",
         rf"(?:字符串)?长度[^\d]{{0,12}}({_bound_value_pattern})",
