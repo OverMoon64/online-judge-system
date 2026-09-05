@@ -101,7 +101,7 @@ class AIModelConfigPayload(StrictModel):
     output_price: float = Field(default=0.0, ge=0)
     price_unit: int = Field(default=1_000_000, gt=0)
     currency: str = Field(default="CNY", min_length=1, max_length=12)
-    disable_thinking: bool = True
+    disable_thinking: bool = False
 
     @field_validator("name")
     @classmethod

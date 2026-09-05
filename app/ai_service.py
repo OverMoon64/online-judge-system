@@ -241,8 +241,6 @@ def _reasoning_request_options(
     model = config.model.lower()
     is_dashscope = "aliyuncs.com" in host
     if reasoning_effort == "auto":
-        if is_dashscope and model.startswith("qwen") and config.disable_thinking:
-            return {"enable_thinking": False}
         return {}
 
     budgets = {"low": 4096, "medium": 8192, "high": 16_384, "max": 32_768}

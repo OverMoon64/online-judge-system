@@ -337,9 +337,15 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
         {"choices": [{"message": {"content": "answer"}}], "usage": {"total_tokens": 1}}
     )
     await ai_service._provider_request(qwen, [], json_mode=True)
-    assert _FakeClient.last_json["enable_thinking"] is False
+    assert "enable_thinking" not in _FakeClient.last_json
     assert _FakeClient.last_json["max_completion_tokens"] == 12_000
     assert _FakeClient.last_json["response_format"] == {"type": "json_object"}
+    assert (
+        ai_service._reasoning_request_options(
+            qwen.model_copy(update={"disable_thinking": True}), "auto"
+        )
+        == {}
+    )
 
     await ai_service._provider_request(qwen, [], reasoning_effort="high")
     assert _FakeClient.last_json["enable_thinking"] is True
