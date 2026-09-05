@@ -6,6 +6,9 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from frontend.app import (
+    MODEL_COMPATIBILITY,
+    REASONING_LABELS,
+    STRESS_PROMPT_EXAMPLES,
     compact_preview,
     output_calibration_rows,
     resolve_problem_selection,
@@ -13,6 +16,15 @@ from frontend.app import (
     status_badge,
     submission_verdict,
 )
+
+
+def test_ai_page_lists_required_model_families_and_stress_examples() -> None:
+    compatibility = " ".join(str(item) for item in MODEL_COMPATIBILITY)
+    assert all(name in compatibility for name in ("Qwen", "DeepSeek", "Kimi"))
+    assert "OpenAI-compatible" in compatibility
+    assert set(REASONING_LABELS) == {"auto", "low", "medium", "high", "max"}
+    assert len(STRESS_PROMPT_EXAMPLES) >= 4
+    assert all("大数据" in prompt or "压力" in prompt for _, prompt in STRESS_PROMPT_EXAMPLES)
 
 
 @pytest.mark.parametrize(

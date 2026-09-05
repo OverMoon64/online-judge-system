@@ -174,6 +174,8 @@ class _FakeStreamContext:
 class _FakeClient:
     response: _FakeResponse | Exception
     fallback_response: _FakeResponse | Exception | None = None
+    post_responses: list[_FakeResponse | Exception] = []
+    post_jsons: list[dict] = []
     last_json: dict | None = None
 
     def __init__(self, *args, **kwargs) -> None:
@@ -186,8 +188,13 @@ class _FakeClient:
         del args
 
     async def post(self, *args, **kwargs):
-        del args, kwargs
-        response = self.fallback_response or self.response
+        del args
+        self.__class__.post_jsons.append(kwargs["json"])
+        response = (
+            self.__class__.post_responses.pop(0)
+            if self.__class__.post_responses
+            else self.fallback_response or self.response
+        )
         if isinstance(response, Exception):
             raise response
         return response
@@ -200,6 +207,8 @@ class _FakeClient:
 
 async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ai_service.httpx, "AsyncClient", _FakeClient)
+    _FakeClient.post_responses = []
+    _FakeClient.post_jsons = []
     _FakeClient.response = _FakeResponse(
         {
             "choices": [{"message": {"content": "answer"}}],
@@ -308,6 +317,16 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     )
     assert detailed["cached_input_tokens"] == 4
     assert detailed["reasoning_tokens"] == 7
+    kimi_usage = ai_service._token_usage(
+        {
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "cached_tokens": 6,
+            "reasoning_tokens": 8,
+        }
+    )
+    assert kimi_usage["cached_input_tokens"] == 6
+    assert kimi_usage["reasoning_tokens"] == 8
 
     qwen = AIModelConfigPayload(
         provider_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -321,6 +340,61 @@ async def test_ai_provider_protocol_and_json_helpers(monkeypatch: pytest.MonkeyP
     assert _FakeClient.last_json["enable_thinking"] is False
     assert _FakeClient.last_json["max_completion_tokens"] == 12_000
     assert _FakeClient.last_json["response_format"] == {"type": "json_object"}
+
+    await ai_service._provider_request(qwen, [], reasoning_effort="high")
+    assert _FakeClient.last_json["enable_thinking"] is True
+    assert _FakeClient.last_json["thinking_budget"] == 16_384
+    assert _FakeClient.last_json["temperature"] == 0.35
+
+    deepseek = AIModelConfigPayload(
+        provider_url="https://api.deepseek.com",
+        model="deepseek-v4-flash",
+        api_key="secret",
+    )
+    assert ai_service._reasoning_request_options(deepseek, "medium") == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+    }
+    dashscope_deepseek = deepseek.model_copy(
+        update={"provider_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"}
+    )
+    assert ai_service._reasoning_request_options(dashscope_deepseek, "max") == {
+        "enable_thinking": True,
+        "reasoning_effort": "max",
+    }
+    kimi = AIModelConfigPayload(
+        provider_url="https://api.moonshot.cn/v1",
+        model="kimi-k2.6",
+        api_key="secret",
+    )
+    assert ai_service._reasoning_request_options(kimi, "low") == {"thinking": {"type": "disabled"}}
+    assert ai_service._reasoning_request_options(kimi, "high") == {"thinking": {"type": "enabled"}}
+    await ai_service._provider_request(kimi, [], reasoning_effort="high")
+    assert _FakeClient.last_json["thinking"] == {"type": "enabled"}
+    assert "temperature" not in _FakeClient.last_json
+
+    generic = AIModelConfigPayload(
+        provider_url="https://openai-compatible.test/v1",
+        model="custom-reasoner",
+        api_key="secret",
+    )
+    _FakeClient.response = _FakeResponse({}, status_code=400)
+    _FakeClient.fallback_response = None
+    _FakeClient.post_responses = [
+        _FakeResponse({}, status_code=400),
+        _FakeResponse(
+            {
+                "choices": [{"message": {"content": "compatible answer"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3},
+            }
+        ),
+    ]
+    _FakeClient.post_jsons = []
+    content, usage = await ai_service._provider_request(generic, [], reasoning_effort="max")
+    assert content == "compatible answer"
+    assert usage["reasoning_fallback"] is True
+    assert _FakeClient.post_jsons[0]["reasoning_effort"] == "max"
+    assert "reasoning_effort" not in _FakeClient.post_jsons[1]
 
 
 async def test_private_ai_provider_rules(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

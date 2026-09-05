@@ -28,6 +28,7 @@ def test_problem_task_uses_automatic_testcase_strategy_by_default():
     payload = AIProblemTaskPayload(requirement="设计一道用于课程验收的算法题目")
     assert payload.testcase_count is None
     assert payload.difficulty == "自动"
+    assert payload.reasoning_effort == "auto"
     assert (
         AIProblemTaskPayload(
             requirement="根据题意自动选择一道合适难度的算法题",
@@ -39,6 +40,11 @@ def test_problem_task_uses_automatic_testcase_strategy_by_default():
         AIProblemTaskPayload(
             requirement="无效难度应该在请求阶段直接被拒绝",
             difficulty="未知",
+        )
+    with pytest.raises(ValidationError):
+        AIProblemTaskPayload(
+            requirement="无效推理强度应该在请求阶段直接被拒绝",
+            reasoning_effort="ultra",
         )
 
 
@@ -221,11 +227,13 @@ async def test_ai_config_generation_usage_and_secret_masking(
 
     calls = 0
     used_models: set[str] = set()
+    used_efforts: set[str] = set()
 
-    async def fake_provider(provider_config, *_args, **_kwargs):
+    async def fake_provider(provider_config, *_args, **kwargs):
         nonlocal calls
         calls += 1
         used_models.add(provider_config.model)
+        used_efforts.add(kwargs.get("reasoning_effort", "missing"))
         content = "命题蓝图" if calls == 1 else json.dumps(generated_payload(), ensure_ascii=False)
         return content, {"input_tokens": 100, "output_tokens": 50}
 
@@ -238,6 +246,7 @@ async def test_ai_config_generation_usage_and_secret_masking(
             "knowledge_points": ["标准输入输出"],
             "difficulty": "入门",
             "testcase_count": 3,
+            "reasoning_effort": "high",
         },
     )
     assert response.status_code == 200
@@ -255,6 +264,7 @@ async def test_ai_config_generation_usage_and_secret_masking(
     assert task["usage"]["output_tokens"] == 100
     assert task["usage"]["cost"] == 0.0012
     assert task["usage"]["model_config_name"] == "primary"
+    assert task["usage"]["reasoning_effort"] == "high"
     assert task["usage"]["request_count"] == 2
     assert [item["stage"] for item in task["usage"]["calls"]] == [
         "需求分析",
@@ -262,6 +272,7 @@ async def test_ai_config_generation_usage_and_secret_masking(
     ]
     assert task["result"]["problem"]["author"] == "course-demo-model"
     assert used_models == {"course-demo-model"}
+    assert used_efforts == {"high"}
     listed = await client.get("/api/ai/model-configs/")
     primary = next(item for item in listed.json()["data"]["models"] if item["name"] == "primary")
     assert primary["usage"]["input_tokens"] == 200
@@ -900,6 +911,27 @@ def test_fibonacci_file_stress_uses_declared_integer_boundary() -> None:
     assert candidate.template == "bounded_integer"
     assert candidate.input == "100000\n"
     assert candidate.scale == {"n": 100000}
+
+
+@pytest.mark.parametrize(
+    "constraints",
+    [
+        "1 <= N <= 100,000",
+        r"对于 100% 的数据，$1 \le n \le 10^5$",
+        r"1 \le n \le 5 \times 10^5",
+    ],
+)
+def test_file_stress_accepts_common_model_constraint_notation(constraints: str) -> None:
+    payload = stress_array_payload()
+    payload["problem"]["constraints"] = constraints
+    generated = GeneratedProblem.model_validate(payload)
+    request = AIProblemTaskPayload(requirement="用最大规模数组严格验证时间复杂度")
+
+    candidate = infer_stress_candidate(generated, request)
+
+    assert candidate is not None
+    assert candidate.template == "counted_integer_array"
+    assert candidate.scale == {"n": 75000}
 
 
 async def test_ai_file_stress_is_optional_and_used_by_judge(
