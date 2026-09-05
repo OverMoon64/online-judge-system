@@ -23,7 +23,11 @@ from app.config import get_settings
 from app.db import AIProblemTask, Problem, utc_now
 from app.judge import ReferenceExecution, execute_reference_solution, normalize_output
 from app.schemas import AIModelConfigPayload, AIProblemTaskPayload, GeneratedProblem
-from app.stress_cases import build_optional_file_stress, stress_requested
+from app.stress_cases import (
+    build_optional_file_stress,
+    build_testcase_validity_report,
+    stress_requested,
+)
 from app.testcase_files import remove_file_testcases
 
 _model_configs: dict[int, dict[str, AIModelConfigPayload]] = {}
@@ -920,13 +924,12 @@ def _generation_prompt(
         if request.difficulty == "自动"
         else f"difficulty 必须填写 {request.difficulty}。"
     )
-    file_stress_instruction = ""
-    if stress_requested(request):
-        file_stress_instruction = (
-            "本需求要求大数据或复杂度验证。若题意适合，请优先采用系统可识别的单实例输入："
-            "单个整数 N、第一行 N 第二行 N 个整数、单个字符串、N×M 整数网格，或第一行 N M "
-            "后接 M 条边；constraints 必须明确写出 N/M/字符串长度的数值上限，样例不得省略数据。"
-        )
+    file_stress_instruction = (
+        "为保证测试用例有效性，若题意适合，请优先采用系统可识别的单实例输入："
+        "单个整数 N、第一行 N 第二行 N 个整数、单个字符串、N×M 整数网格，或第一行 N M "
+        "后接 M 条边；constraints 必须明确写出变量的最小值和最大值。系统会在普通命题成功后"
+        "确定性构造最小边界与最大规模 .in/.out 点，并用两份参考程序交叉验证。"
+    )
     return f"""
 你是程序设计训练课程的严谨命题专家。请根据命题需求和分析草案生成一道可直接导入 OJ 的题目。
 
@@ -1405,19 +1408,25 @@ async def _run_problem_task(
             "applied": False,
             "count": 0,
         }
-        if file_stress["requested"]:
-            await _update_task(
-                task_id,
-                progress="正在尝试生成文件压力测试点",
-                progress_percent=96,
-                usage=usage,
+        await _update_task(
+            task_id,
+            progress="正在验证边界覆盖与复杂度压力点",
+            progress_percent=96,
+            usage=usage,
+        )
+        try:
+            file_stress = await asyncio.wait_for(
+                build_optional_file_stress(generated, request), timeout=20
             )
-            try:
-                file_stress = await asyncio.wait_for(
-                    build_optional_file_stress(generated, request), timeout=20
-                )
-            except TimeoutError:
-                file_stress["reason"] = "文件压力点生成超时，已保留普通测试点"
+        except asyncio.TimeoutError:
+            file_stress.update(
+                {
+                    "attempted": True,
+                    "coverage": {"boundary": False, "scale": False},
+                    "reason": "文件压力点生成超时，已保留普通测试点",
+                }
+            )
+        testcase_validity = build_testcase_validity_report(generated, file_stress)
         result = generated.model_dump(mode="json")
         result["validation"] = {
             "passed": True,
@@ -1430,6 +1439,7 @@ async def _run_problem_task(
             "resource_limits": resource_limits,
             "difficulty": difficulty_policy,
             "file_stress": file_stress,
+            "testcase_validity": testcase_validity,
             "id_assignment": {
                 "source": "existing" if existing else "automatic",
                 "model_id": original_problem_id,

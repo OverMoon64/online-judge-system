@@ -9,7 +9,11 @@ from pydantic import ValidationError
 
 from app import ai_service, judge
 from app.schemas import AIModelConfigPayload, AIProblemTaskPayload, GeneratedProblem, ProblemPayload
-from app.stress_cases import infer_stress_candidate
+from app.stress_cases import (
+    build_testcase_validity_report,
+    infer_stress_candidate,
+    infer_validity_candidates,
+)
 from app.testcase_files import load_file_testcases
 from tests.conftest import login
 
@@ -255,11 +259,12 @@ async def test_ai_config_generation_usage_and_secret_masking(
     assert task["status"] == "completed", task
     assert task["result"]["validation"]["passed"] is True
     assert task["result"]["validation"]["reference_languages"] == ["python", "cpp"]
-    assert task["result"]["validation"]["file_stress"] == {
-        "requested": False,
-        "applied": False,
-        "count": 0,
-    }
+    file_stress = task["result"]["validation"]["file_stress"]
+    assert file_stress["requested"] is False
+    assert file_stress["attempted"] is True
+    assert file_stress["applied"] is False
+    assert file_stress["coverage"] == {"boundary": False, "scale": False}
+    assert task["result"]["validation"]["testcase_validity"]["score"] == 40
     assert task["usage"]["input_tokens"] == 200
     assert task["usage"]["output_tokens"] == 100
     assert task["usage"]["cost"] == 0.0012
@@ -332,6 +337,10 @@ async def test_ai_calibrates_fibonacci_outputs_with_two_model_calls(
         "517691607",
         "911435502",
     ]
+    file_stress = task["result"]["validation"]["file_stress"]
+    assert file_stress["requested"] is False
+    assert file_stress["coverage"] == {"boundary": True, "scale": True}
+    assert task["result"]["validation"]["testcase_validity"]["score"] == 100
 
 
 async def test_ai_refuses_consensus_without_anchor_and_reports_disagreement() -> None:
@@ -913,6 +922,35 @@ def test_fibonacci_file_stress_uses_declared_integer_boundary() -> None:
     assert candidate.scale == {"n": 100000}
 
 
+def test_validity_candidates_include_minimum_and_scale_without_trigger_keywords() -> None:
+    generated = GeneratedProblem.model_validate(stress_array_payload())
+    request = AIProblemTaskPayload(requirement="生成一道适合课堂练习的数组求和题目")
+
+    candidates = infer_validity_candidates(generated, request)
+
+    assert [candidate.category for candidate in candidates] == ["boundary", "scale"]
+    assert candidates[0].scale == {"n": 1}
+    assert candidates[1].scale == {"n": 50000}
+
+
+def test_validity_report_does_not_hide_missing_scale_evidence() -> None:
+    generated = GeneratedProblem.model_validate(generated_payload())
+    report = build_testcase_validity_report(
+        generated,
+        {
+            "coverage": {"boundary": False, "scale": False},
+            "applied": False,
+            "count": 0,
+        },
+    )
+
+    assert report["passed"] is False
+    assert report["score"] == 40
+    failed = {check["key"] for check in report["checks"] if not check["passed"]}
+    assert failed == {"boundary_coverage", "scale_coverage", "complexity_discrimination"}
+    assert report["manual_review_required"] is True
+
+
 @pytest.mark.parametrize(
     "constraints",
     [
@@ -981,19 +1019,24 @@ async def test_ai_file_stress_is_optional_and_used_by_judge(
     file_stress = task["result"]["validation"]["file_stress"]
     assert file_stress["applied"] is True
     assert file_stress["template"] == "counted_integer_array"
-    assert file_stress["count"] == 1
+    assert file_stress["count"] == 2
     assert file_stress["input_bytes"] > 50_000
+    assert file_stress["coverage"] == {"boundary": True, "scale": True}
+    validity = task["result"]["validation"]["testcase_validity"]
+    assert validity["passed"] is True
+    assert validity["score"] == 100
+    assert all(check["passed"] for check in validity["checks"])
 
     problem_data = task["result"]["problem"]
     problem = ProblemPayload.model_validate(problem_data)
     file_cases = await load_file_testcases(problem)
-    assert len(file_cases) == 1
+    assert len(file_cases) == 2
     assert file_cases[0]["input_file"].endswith(".in")
     assert file_cases[0]["output_file"].endswith(".out")
 
     assert (await client.post("/api/problems/", json=problem_data)).status_code == 200
     detail = (await client.get(f"/api/problems/{problem.id}")).json()["data"]
-    assert detail["file_testcase_count"] == 1
+    assert detail["file_testcase_count"] == 2
 
     submitted = await client.post(
         "/api/submissions/",
@@ -1014,7 +1057,7 @@ async def test_ai_file_stress_is_optional_and_used_by_judge(
     await judge.wait_for_submission(submission_id, timeout=10)
     judged = (await client.get(f"/api/submissions/{submission_id}")).json()["data"]
     assert judged["result"] == "TLE"
-    assert judged["counts"] == 40
+    assert judged["counts"] == 50
     log = (await client.get(f"/api/submissions/{submission_id}/log")).json()["data"]
     assert log["details"][-1]["source"] == "file"
 
@@ -1054,9 +1097,15 @@ async def test_unsupported_file_stress_never_fails_ai_task(
 
     assert task["status"] == "completed", task
     assert calls == 2
-    assert task["result"]["validation"]["file_stress"] == {
+    file_stress = task["result"]["validation"]["file_stress"]
+    assert file_stress == {
         "requested": True,
+        "attempted": True,
         "applied": False,
         "count": 0,
+        "coverage": {"boundary": False, "scale": False},
         "reason": "未能安全识别受支持的输入结构",
     }
+    validity = task["result"]["validation"]["testcase_validity"]
+    assert validity["passed"] is False
+    assert validity["score"] == 40

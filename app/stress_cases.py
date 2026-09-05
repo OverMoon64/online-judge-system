@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from app.judge import ReferenceExecution, execute_reference_solution, normalize_output
+from app.judge import execute_reference_solution, normalize_output
 from app.schemas import AIProblemTaskPayload, GeneratedProblem
 from app.testcase_files import write_file_testcases
 
@@ -33,6 +33,7 @@ class StressCandidate:
     label: str
     input: str
     scale: dict[str, int]
+    category: str = "scale"
 
 
 def stress_requested(request: AIProblemTaskPayload) -> bool:
@@ -64,6 +65,23 @@ def _upper_bound(constraints: str, variable: str) -> int | None:
     patterns = (
         rf"(?<![a-z0-9_]){escaped}(?![a-z0-9_])\s*(?:<=|≤)\s*({_bound_value_pattern})",
         rf"(?:最大|上限|max)[^\n]{{0,20}}(?<![a-z0-9_]){escaped}(?![a-z0-9_])[^\d]{{0,8}}({_bound_value_pattern})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, constraints, flags=re.IGNORECASE)
+        if match:
+            try:
+                return _parse_bound_value(match.group(1))
+            except (TypeError, ValueError, OverflowError):
+                return None
+    return None
+
+
+def _lower_bound(constraints: str, variable: str) -> int | None:
+    constraints = _normalize_constraint_notation(constraints)
+    escaped = re.escape(variable)
+    patterns = (
+        rf"({_bound_value_pattern})\s*(?:<=|<)\s*(?<![a-z0-9_]){escaped}(?![a-z0-9_])",
+        rf"(?<![a-z0-9_]){escaped}(?![a-z0-9_])\s*(?:>=|>)\s*({_bound_value_pattern})",
     )
     for pattern in patterns:
         match = re.search(pattern, constraints, flags=re.IGNORECASE)
@@ -265,13 +283,74 @@ def infer_stress_candidate(
     return _string_candidate(sample_input, constraints, context)
 
 
-def _execution_error(execution: ReferenceExecution) -> str | None:
-    if execution.setup_error:
-        return execution.setup_error
-    if len(execution.results) != 1:
-        return "参考程序没有返回唯一压力点结果"
-    result = execution.results[0]
-    return None if result.status == "OK" else result.status
+def _boundary_candidate(
+    generated: GeneratedProblem, candidate: StressCandidate
+) -> StressCandidate | None:
+    sample_input = _first_input(generated)
+    if sample_input is None:
+        return None
+    numbers = _integers(sample_input)
+    constraints = generated.problem.constraints
+    if candidate.template == "bounded_integer":
+        lower = _lower_bound(constraints, "n")
+        if lower is None:
+            lower = 0 if re.search(r"0\s*(?:<=|<)\s*n", constraints, re.IGNORECASE) else 1
+        return StressCandidate(
+            candidate.template,
+            "最小整数边界",
+            f"{lower}\n",
+            {"n": lower},
+            "boundary",
+        )
+    if candidate.template == "counted_integer_array" and numbers and len(numbers) > 1:
+        size = max(1, _lower_bound(constraints, "n") or 1)
+        return StressCandidate(
+            candidate.template,
+            "最小数组边界",
+            f"{size}\n" + " ".join([str(numbers[1])] * size) + "\n",
+            {"n": size},
+            "boundary",
+        )
+    if candidate.template == "integer_grid" and numbers and len(numbers) > 2:
+        rows = max(1, _lower_bound(constraints, "n") or 1)
+        columns = max(1, _lower_bound(constraints, "m") or rows)
+        row = " ".join([str(numbers[2])] * columns)
+        return StressCandidate(
+            candidate.template,
+            "最小网格边界",
+            f"{rows} {columns}\n" + "\n".join([row] * rows) + "\n",
+            {"n": rows, "m": columns},
+            "boundary",
+        )
+    if candidate.template == "graph_chain":
+        return StressCandidate(
+            candidate.template,
+            "最小图边界",
+            "1 0\n",
+            {"n": 1, "m": 0},
+            "boundary",
+        )
+    if candidate.template == "single_string":
+        token = sample_input.split()[0]
+        length = max(1, _lower_bound(constraints, "n") or 1)
+        return StressCandidate(
+            candidate.template,
+            "最短字符串边界",
+            token[0] * length + "\n",
+            {"length": length},
+            "boundary",
+        )
+    return None
+
+
+def infer_validity_candidates(
+    generated: GeneratedProblem, request: AIProblemTaskPayload
+) -> list[StressCandidate]:
+    scale = infer_stress_candidate(generated, request)
+    if scale is None:
+        return []
+    boundary = _boundary_candidate(generated, scale)
+    return [candidate for candidate in (boundary, scale) if candidate is not None]
 
 
 async def build_optional_file_stress(
@@ -280,38 +359,57 @@ async def build_optional_file_stress(
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "requested": stress_requested(request),
+        "attempted": True,
         "applied": False,
         "count": 0,
+        "coverage": {"boundary": False, "scale": False},
     }
-    if not metadata["requested"]:
-        return metadata
     if request.problem_id:
         metadata["reason"] = "修改已有题目时不预写文件压力点"
         return metadata
-    candidate = infer_stress_candidate(generated, request)
-    if candidate is None:
+    candidates = infer_validity_candidates(generated, request)
+    if not candidates:
         metadata["reason"] = "未能安全识别受支持的输入结构"
         return metadata
-    metadata.update(
-        {"template": candidate.template, "label": candidate.label, "scale": candidate.scale}
+    scale_candidate = next(
+        (candidate for candidate in candidates if candidate.category == "scale"), candidates[-1]
     )
+    metadata.update(
+        {
+            "template": scale_candidate.template,
+            "label": scale_candidate.label,
+            "scale": scale_candidate.scale,
+        }
+    )
+    inline_inputs = {
+        case.input.strip() for case in [*generated.problem.samples, *generated.problem.testcases]
+    }
+    pending: list[StressCandidate] = []
+    for candidate in candidates:
+        if candidate.input.strip() in inline_inputs:
+            metadata["coverage"][candidate.category] = True
+        else:
+            pending.append(candidate)
+    if not pending:
+        metadata["reason"] = "边界与规模数据已由普通测试点覆盖"
+        return metadata
     try:
         python_execution, cpp_execution = await asyncio.gather(
             execute_reference_solution(
                 generated.problem,
                 generated.reference_solution,
                 "python",
-                inputs=[candidate.input],
+                inputs=[candidate.input for candidate in pending],
             ),
             execute_reference_solution(
                 generated.problem,
                 generated.reference_solution_cpp,
                 "cpp",
-                inputs=[candidate.input],
+                inputs=[candidate.input for candidate in pending],
             ),
         )
-        python_error = _execution_error(python_execution)
-        cpp_error = _execution_error(cpp_execution)
+        python_error = python_execution.setup_error
+        cpp_error = cpp_execution.setup_error
         metadata["reference_status"] = {
             "python": python_error or "OK",
             "cpp": cpp_error or "OK",
@@ -319,10 +417,25 @@ async def build_optional_file_stress(
         if python_error or cpp_error:
             metadata["reason"] = "参考程序未在压力点资源限制内完成"
             return metadata
-        python_result = python_execution.results[0]
-        cpp_result = cpp_execution.results[0]
-        if normalize_output(python_result.stdout) != normalize_output(cpp_result.stdout):
-            metadata["reason"] = "Python/C++ 压力点输出不一致"
+        accepted: list[tuple[StressCandidate, Any, Any]] = []
+        rejected: list[dict[str, str]] = []
+        for index, candidate in enumerate(pending):
+            python_result = python_execution.results[index]
+            cpp_result = cpp_execution.results[index]
+            reason = None
+            if python_result.status != "OK" or cpp_result.status != "OK":
+                reason = f"Python={python_result.status}, C++={cpp_result.status}"
+            elif normalize_output(python_result.stdout) != normalize_output(cpp_result.stdout):
+                reason = "Python/C++ 输出不一致"
+            if reason:
+                rejected.append({"label": candidate.label, "reason": reason})
+                continue
+            metadata["coverage"][candidate.category] = True
+            accepted.append((candidate, python_result, cpp_result))
+        if rejected:
+            metadata["rejected"] = rejected
+        if not accepted:
+            metadata["reason"] = "候选边界与规模点均未通过双语言校验"
             return metadata
         manifest = await write_file_testcases(
             generated.problem,
@@ -332,20 +445,39 @@ async def build_optional_file_stress(
                     "input": candidate.input,
                     "output": python_result.stdout,
                 }
+                for candidate, python_result, _ in accepted
             ],
-            metadata={"template": candidate.template, "scale": candidate.scale},
+            metadata={
+                "template": scale_candidate.template,
+                "cases": [
+                    {"category": candidate.category, "scale": candidate.scale}
+                    for candidate, _, _ in accepted
+                ],
+            },
         )
-        file_case = manifest["cases"][0]
+        file_cases = manifest["cases"]
         metadata.update(
             {
                 "applied": True,
-                "count": 1,
-                "input_bytes": file_case["input_bytes"],
-                "output_bytes": file_case["output_bytes"],
-                "files": [{"input": file_case["input_file"], "output": file_case["output_file"]}],
+                "count": len(file_cases),
+                "input_bytes": sum(case["input_bytes"] for case in file_cases),
+                "output_bytes": sum(case["output_bytes"] for case in file_cases),
+                "files": [
+                    {"input": case["input_file"], "output": case["output_file"]}
+                    for case in file_cases
+                ],
+                "cases": [
+                    {
+                        "label": candidate.label,
+                        "category": candidate.category,
+                        "scale": candidate.scale,
+                        "input_bytes": file_case["input_bytes"],
+                    }
+                    for (candidate, _, _), file_case in zip(accepted, file_cases, strict=True)
+                ],
                 "reference_time": {
-                    "python": round(python_result.elapsed, 4),
-                    "cpp": round(cpp_result.elapsed, 4),
+                    "python": round(max(result.elapsed for _, result, _ in accepted), 4),
+                    "cpp": round(max(result.elapsed for _, _, result in accepted), 4),
                 },
             }
         )
@@ -355,3 +487,61 @@ async def build_optional_file_stress(
     except Exception as exc:
         metadata["reason"] = f"文件压力点生成失败：{str(exc)[:160]}"
         return metadata
+
+
+def build_testcase_validity_report(
+    generated: GeneratedProblem, file_stress: dict[str, Any]
+) -> dict[str, Any]:
+    hidden_inputs = [case.input.strip() for case in generated.problem.testcases]
+    coverage = file_stress.get("coverage") or {}
+    checks = [
+        {
+            "key": "reference_consensus",
+            "label": "答案正确性",
+            "passed": True,
+            "detail": "全部样例和测试点已通过 Python/C++ 双语言交叉运行",
+        },
+        {
+            "key": "input_diversity",
+            "label": "输入多样性",
+            "passed": len(hidden_inputs) >= 2 and len(set(hidden_inputs)) == len(hidden_inputs),
+            "detail": f"{len(hidden_inputs)} 个隐藏测试点，输入互不重复",
+        },
+        {
+            "key": "boundary_coverage",
+            "label": "边界覆盖",
+            "passed": bool(coverage.get("boundary")),
+            "detail": (
+                "最小边界已由普通测试点或双语言校验的文件点覆盖"
+                if coverage.get("boundary")
+                else "未能从输入契约安全构造最小边界，请人工补充"
+            ),
+        },
+        {
+            "key": "scale_coverage",
+            "label": "最大规模",
+            "passed": bool(coverage.get("scale")),
+            "detail": (
+                f"已覆盖压力规模 {file_stress.get('scale', {})}"
+                if coverage.get("scale")
+                else "未能从输入契约安全构造最大规模数据，请人工补充"
+            ),
+        },
+        {
+            "key": "complexity_discrimination",
+            "label": "复杂度区分",
+            "passed": bool(coverage.get("scale")),
+            "detail": (
+                "最大规模点已纳入正式判题，可用于淘汰常见低效实现"
+                if coverage.get("scale")
+                else "缺少已验证的规模点，暂不能证明可区分不同复杂度"
+            ),
+        },
+    ]
+    score = sum(20 for check in checks if check["passed"])
+    return {
+        "passed": score == 100,
+        "score": score,
+        "checks": checks,
+        "manual_review_required": True,
+    }
