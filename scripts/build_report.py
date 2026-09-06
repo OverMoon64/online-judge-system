@@ -411,17 +411,17 @@ def build(output: Path, test_summary: str) -> None:
         ),
         p("会话与密码", s["h2"]),
         p(
-            "登录后由后端签发随机 Session Token，数据库仅保存其哈希和有效期；浏览器 Cookie 设置为 HttpOnly，退出时服务端撤销会话并清除 Cookie。密码使用 bcrypt 哈希，且用户可以修改自己的密码。启动和重置均确保存在 admin / admintestpassword；每次请求重新读取用户角色，因此角色变更和封禁立即生效。",
+            "登录后由后端签发随机 Session Token，签名 Cookie 设置为 HttpOnly，数据库保存当前有效 Token；退出时服务端撤销 Token 并清除 Cookie，因此旧签名 Cookie 无法重放。密码使用 bcrypt 哈希，且用户可以修改自己的密码。启动和重置均确保存在 admin / admintestpassword；每次请求重新读取用户角色，因此角色变更和封禁立即生效。",
             s["body"],
         ),
         p("日志访问矩阵", s["h2"]),
         table(
             [
-                ["场景", "结果", "是否审计"],
-                ["管理员访问存在日志", "允许", "是"],
-                ["本人 + 题目公开日志", "允许", "是"],
-                ["本人 + 题目隐藏日志", "允许", "是"],
-                ["访问他人提交", "403", "是（资源存在）"],
+                ["场景", "返回内容", "是否审计"],
+                ["管理员", "完整 details + 总分", "是"],
+                ["已登录用户 + public_cases=True", "完整 details + 总分", "是"],
+                ["提交者 + public_cases=False", "仅 score / counts", "是"],
+                ["其他用户 + public_cases=False", "403", "是（资源存在）"],
                 ["未登录 / 参数错误 / 资源不存在", "401 / 400 / 404", "否"],
             ],
             [73 * mm, 37 * mm, 50 * mm],
@@ -499,8 +499,8 @@ def build(output: Path, test_summary: str) -> None:
                 ["需求分析", "10%", "难度、知识点、约束与歧义分析"],
                 ["题面与双语解法", "45%", "完整题面、Python/C++ 参考代码和初始输入"],
                 ["交叉运行与答案校准", "75%", "双解逐点共识，校准错误或空白答案"],
-                ["定向修复", "80–94%", "仅在必要时携带诊断反馈，最多重试两次"],
-                ["边界与规模有效性", "96–100%", "确定性大数据文件点、试运行与有效性评分"],
+                ["定向修复", "80-94%", "仅在必要时携带诊断反馈，最多重试两次"],
+                ["边界与规模有效性", "96-100%", "确定性大数据文件点、试运行与有效性评分"],
             ],
             [38 * mm, 24 * mm, 98 * mm],
         ),
@@ -516,7 +516,7 @@ def build(output: Path, test_summary: str) -> None:
         ),
         p("测试用例有效性", s["h2"]),
         p(
-            "AI 题目在生成成功后尝试构造确定性的最小边界点和最大规模文件点，覆盖标量、数组、字符串、网格与图等常见输入结构。系统通过 Python/C++ 共识生成 .in/.out，并给出 0–100 的有效性评分与逐项说明；无法可靠识别格式时安全降级，不阻断题目生成，也不额外消耗模型 Token。",
+            "AI 题目在生成成功后尝试构造确定性的最小边界点和最大规模文件点，覆盖标量、数组、字符串、网格与图等常见输入结构。系统通过 Python/C++ 共识生成 .in/.out，并给出 0-100 的有效性评分与逐项说明；无法可靠识别格式时安全降级，不阻断题目生成，也不额外消耗模型 Token。",
             s["body"],
         ),
         p(
@@ -526,7 +526,7 @@ def build(output: Path, test_summary: str) -> None:
         PageBreak(),
         p("6　Streamlit 前端", s["h1"]),
         p(
-            "前端采用顶部中文导航，按账户、题库与评测、提交记录、AI 智能命题和后台管理组织。题目详情与代码编辑器位于同一页，提交记录和详情独立分页。浏览器 Cookie 被加密保存并在 Streamlit 进程刷新时恢复，统一 API 客户端始终使用同一 Base URL；所有操作仅调用 REST API，权限最终仍由后端判断。",
+            "前端采用顶部中文导航，按账户、题库与评测、提交记录、AI 智能命题和后台管理组织。题目详情与代码编辑器位于同一页，提交记录和详情独立分页。浏览器 Cookie 被加密保存并绑定当前 Streamlit 服务进程：完整刷新可恢复，服务重启会拒绝并删除旧载荷。统一 API 客户端始终使用同一 Base URL；所有操作仅调用 REST API，权限最终仍由后端判断。",
             s["body"],
         ),
         p("页面覆盖", s["h2"]),
@@ -543,7 +543,7 @@ def build(output: Path, test_summary: str) -> None:
         ),
         p("异步反馈", s["h2"]),
         p(
-            "提交详情使用局部刷新显示 pending/running 到最终状态，AC、WA、TLE、MLE、RE、CE 和 UNK 使用一致的彩色状态标记。所有 API 错误统一展示 HTTP 状态、code 与 msg；401 会清理失效会话。完整刷新可恢复有效会话，退出会调用后端 logout、撤销服务端 Token 并清理本地 Cookie。",
+            "提交详情使用局部刷新显示 pending/running 到最终状态，AC、WA、TLE、MLE、RE、CE 和 UNK 使用一致的彩色状态标记。私有日志只显示 score/counts，公开日志或管理员才显示逐点结果。所有 API 错误统一展示 HTTP 状态、code 与 msg；401 会清理失效会话。完整刷新可恢复有效会话，服务重启不恢复旧账号；退出会调用后端 logout、撤销服务端 Token 并清理本地 Cookie。Streamlit 以 headless 模式监听 127.0.0.1，不依赖 WSL Interoperability 自动打开浏览器。",
             s["body"],
         ),
     ]
@@ -569,17 +569,17 @@ def build(output: Path, test_summary: str) -> None:
             [
                 ["测试域", "代表场景"],
                 ["契约", "字段校验、统一响应、422→400、错误优先级"],
-                ["认证", "登录 Cookie 跨 rerun/完整刷新、退出清理、旧 Cookie 重放拒绝、封禁"],
+                ["认证", "Cookie 跨 rerun/完整刷新、服务重启失效、退出清理、旧 Cookie 拒绝"],
                 ["判题", "Python/C++：AC、WA、RE、CE、TLE、MLE、空白比较；AC 耗时不超限"],
                 ["数据", "分页筛选、限流、去重统计、同 ID 重测、重置"],
-                ["审计", "公开/隐藏日志与成功/拒绝访问记录矩阵"],
+                ["审计", "私有日志仅总分、公开/管理员完整明细、403 与访问记录矩阵"],
                 ["AI", "usage/费用、取消、双解校准、文件压力点、有效性评分与安全降级"],
             ],
             [34 * mm, 126 * mm],
         ),
         p("持续集成", s["h2"]),
         p(
-            "GitHub Actions 在 Ubuntu 和 Python 3.10 上安装 G++，运行 Ruff 静态检查、格式检查与 pytest，并设置 85% 覆盖率门槛。VS Code 配置对应的 WSL 解释器、后端/前端任务、调试入口和测试入口。",
+            "GitHub Actions 在 Ubuntu 和 Python 3.10 上安装 G++，运行 Ruff 静态检查、格式检查与 pytest，并设置 85% 覆盖率门槛。VS Code 配置对应的 WSL 解释器、后端/前端任务、调试入口和测试入口；前端任务固定使用 headless 模式。",
             s["body"],
         ),
         PageBreak(),
@@ -658,7 +658,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--test-summary",
-        default="Ubuntu 22.04、Python 3.10.12、G++ 11.4.0；Ruff 与格式检查通过；pytest 79 passed；覆盖率 89.51%（门槛 85%）；GitHub Actions 成功。",
+        default="Ubuntu 22.04、Python 3.10.12、G++ 11.4.0；Ruff 与格式检查通过；pytest 79 passed；覆盖率 89.57%（门槛 85%）；GitHub Actions 成功。",
     )
     args = parser.parse_args()
     build(args.output.resolve(), args.test_summary)
