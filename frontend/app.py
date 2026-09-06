@@ -898,17 +898,21 @@ def live_submission_panel() -> None:
 def render_submission_log(data: dict[str, Any]) -> None:
     details = data.get("details") or []
     passed = sum(case.get("result") == "AC" for case in details)
-    score_col, count_col, passed_col = st.columns(3)
+    details_visible = "details" in data
+    metrics = st.columns(3 if details_visible else 2)
+    score_col, count_col = metrics[:2]
     score_col.metric("得分", data.get("score", 0))
     count_col.metric("总分", data.get("counts", 0))
-    passed_col.metric("通过测试点", f"{passed} / {len(details)}")
+    if details_visible:
+        metrics[2].metric("通过测试点", f"{passed} / {len(details)}")
     compile_info = data.get("compile_info") or {}
     if compile_info.get("result") == "failed":
         st.error(f"编译失败：{compile_info.get('message') or '请检查语法和编译选项'}")
     if data.get("error_info"):
         st.error(data["error_info"])
     if not details:
-        st.info("暂无测试点明细。")
+        message = "暂无测试点明细。" if details_visible else "该题未公开测试点明细。"
+        st.info(message)
         return
     st.markdown("#### 测试点结果")
     for case in details:

@@ -38,7 +38,7 @@ async def test_python_judging_logs_rejudge_and_stats(client: httpx.AsyncClient) 
     assert result["compile_info"] is None
 
     log = (await client.get(f"/api/submissions/{submission_id}/log")).json()["data"]
-    assert [case["result"] for case in log["details"]] == ["AC", "AC", "AC"]
+    assert log == {"score": 30, "counts": 30}
 
     profile = (await client.get(f"/api/users/{alice['user_id']}")).json()["data"]
     assert profile["submit_count"] == 1
@@ -81,8 +81,8 @@ async def test_wrong_answer_runtime_error_timeout_and_rate_limit(
     for submission_id in ids:
         detail = (await client.get(f"/api/submissions/{submission_id}")).json()["data"]
         log = (await client.get(f"/api/submissions/{submission_id}/log")).json()["data"]
-        assert detail["result"] == log["details"][0]["result"]
-        outcomes.append(log["details"][0]["result"])
+        assert set(log) == {"score", "counts"}
+        outcomes.append(detail["result"])
     assert outcomes == ["WA", "RE", "TLE"]
 
 
@@ -150,6 +150,7 @@ async def test_private_and_public_log_access_is_audited(client: httpx.AsyncClien
     await wait_for_submission(int(submission_id))
     own_private_log = await client.get(f"/api/submissions/{submission_id}/log")
     assert own_private_log.status_code == 200
+    assert own_private_log.json()["data"] == {"score": 30, "counts": 30}
     await client.post("/api/auth/logout")
     await login(client, "viewer")
     assert (await client.get(f"/api/submissions/{submission_id}")).status_code == 403
@@ -157,11 +158,28 @@ async def test_private_and_public_log_access_is_audited(client: httpx.AsyncClien
 
     await client.post("/api/auth/logout")
     await login(client)
+    admin_private_log = await client.get(f"/api/submissions/{submission_id}/log")
+    admin_private_data = admin_private_log.json()["data"]
+    assert admin_private_log.status_code == 200
+    assert set(admin_private_data) == {"details", "score", "counts"}
+    assert [case["result"] for case in admin_private_data["details"]] == ["AC", "AC", "AC"]
     visibility = await client.put("/api/problems/sum_2/log_visibility", json={"public_cases": True})
     assert visibility.status_code == 200
     await client.post("/api/auth/logout")
     await login(client, "viewer")
-    assert (await client.get(f"/api/submissions/{submission_id}/log")).status_code == 200
+    public_log = await client.get(f"/api/submissions/{submission_id}/log")
+    public_data = public_log.json()["data"]
+    assert public_log.status_code == 200
+    assert set(public_data) == {"details", "score", "counts"}
+    assert [case["result"] for case in public_data["details"]] == ["AC", "AC", "AC"]
+    assert (await client.get(f"/api/submissions/{submission_id}")).status_code == 403
+    assert "code" not in public_data
+    assert "compile_info" not in public_data
+
+    await client.post("/api/auth/logout")
+    await login(client, "owner")
+    owner_public_data = (await client.get(f"/api/submissions/{submission_id}/log")).json()["data"]
+    assert [case["result"] for case in owner_public_data["details"]] == ["AC", "AC", "AC"]
 
     await client.post("/api/auth/logout")
     await login(client)

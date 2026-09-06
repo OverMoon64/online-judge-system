@@ -526,7 +526,7 @@ async def get_submission_log(
     if problem is None:
         raise ApiError(404, "problem not found")
 
-    allowed = (
+    can_access = (
         current_user.role == "admin"
         or submission.user_id == current_user.id
         or problem.public_cases
@@ -536,19 +536,20 @@ async def get_submission_log(
             user_id=current_user.id,
             problem_id=submission.problem_id,
             action="view_logs",
-            status="200" if allowed else "403",
+            status="200" if can_access else "403",
         )
     )
     await session.commit()
-    if not allowed:
+    if not can_access:
         raise ApiError(403, "permission denied")
-    return success(
-        {
-            "details": submission.details or [],
-            "score": submission.score,
-            "counts": submission.counts,
-        }
-    )
+
+    data = {
+        "score": submission.score,
+        "counts": submission.counts,
+    }
+    if current_user.role == "admin" or problem.public_cases:
+        data["details"] = submission.details or []
+    return success(data)
 
 
 @router.get("/api/logs/access/")
