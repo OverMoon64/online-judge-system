@@ -232,7 +232,11 @@ def initialize_browser_session() -> None:
         return
 
     st.session_state["_browser_restore_attempted"] = True
-    if not restore_backend_session(get_client(), load_browser_session(store)):
+    payload = load_browser_session(store)
+    if payload is None:
+        return
+    if not restore_backend_session(get_client(), payload):
+        clear_browser_session(store)
         return
     restored = request_json(get_client(), "GET", "/api/auth/session")
     if restored.get("code") == 200:

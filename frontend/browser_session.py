@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
@@ -28,6 +29,12 @@ def browser_cookie_password() -> str:
     return BrowserSessionSettings().session_secret
 
 
+@lru_cache
+def browser_runtime_id() -> str:
+    """Identify one Streamlit server process for refresh-only session restore."""
+    return secrets.token_urlsafe(24)
+
+
 class BrowserCookieStore(Protocol):
     def ready(self) -> bool: ...
 
@@ -49,26 +56,43 @@ def backend_session_cookie(client: httpx.Client) -> str | None:
     return None
 
 
-def serialize_backend_session(client: httpx.Client) -> str | None:
+def serialize_backend_session(client: httpx.Client, *, runtime_id: str | None = None) -> str | None:
     value = backend_session_cookie(client)
     if value is None:
         return None
-    return json.dumps({"version": 1, "cookie": value}, separators=(",", ":"))
+    return json.dumps(
+        {
+            "version": 2,
+            "runtime_id": runtime_id or browser_runtime_id(),
+            "cookie": value,
+        },
+        separators=(",", ":"),
+    )
 
 
-def restore_backend_session(client: httpx.Client, payload: str | None) -> bool:
+def restore_backend_session(
+    client: httpx.Client,
+    payload: str | None,
+    *,
+    runtime_id: str | None = None,
+) -> bool:
+    client.cookies.clear()
     if not payload:
         return False
     try:
         parsed = json.loads(payload)
     except (TypeError, json.JSONDecodeError):
         return False
-    value = (
-        parsed.get("cookie") if isinstance(parsed, dict) and parsed.get("version") == 1 else None
-    )
+    expected_runtime_id = runtime_id or browser_runtime_id()
+    value = None
+    if (
+        isinstance(parsed, dict)
+        and parsed.get("version") == 2
+        and parsed.get("runtime_id") == expected_runtime_id
+    ):
+        value = parsed.get("cookie")
     if not isinstance(value, str) or not value or len(value) > 8_192:
         return False
-    client.cookies.clear()
     client.cookies.set(BACKEND_COOKIE_NAME, value)
     return True
 
