@@ -11,7 +11,7 @@
     {
       "label": "OJ: frontend",
       "type": "shell",
-      "command": "${env:HOME}/.venvs/online-judge-system/bin/streamlit run frontend/app.py --server.port 8501",
+      "command": "${env:HOME}/.venvs/online-judge-system/bin/streamlit run frontend/app.py --server.headless true --server.address 127.0.0.1 --server.port 8501",
       "isBackground": true,
       "problemMatcher": []
     },

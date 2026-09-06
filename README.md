@@ -48,7 +48,7 @@ VS Code 已提供推荐扩展、Python 解释器、调试和任务配置。以 R
 终端二：
 
 ```bash
-~/.venvs/online-judge-system/bin/streamlit run frontend/app.py --server.port 8501
+~/.venvs/online-judge-system/bin/streamlit run frontend/app.py --server.headless true --server.address 127.0.0.1 --server.port 8501
 ```
 
 - 前端：<http://127.0.0.1:8501>
@@ -59,9 +59,13 @@ VS Code 已提供推荐扩展、Python 解释器、调试和任务配置。以 R
 
 Streamlit 把同一个 `httpx.Client` 保存在 `st.session_state` 中，并把后端签名 Session 作为
 加密载荷写入浏览器 Cookie。普通 rerun 直接复用客户端；浏览器完整刷新后，前端恢复载荷并调用
-`GET /api/auth/session` 让后端重新验证用户、角色和服务端 Session Token。退出会同时撤销数据库中的
+`GET /api/auth/session` 让后端重新验证用户、角色和服务端 Session Token。载荷绑定当前 Streamlit
+服务进程，服务重启后旧载荷会被删除，因此不会自动恢复上一次的管理员账号。退出会同时撤销数据库中的
 随机 Token、调用后端 logout 并清理本地及浏览器 Cookie，因此旧签名 Cookie 也不能重放登录。
 若后端返回 401，页面会提示登录已失效并回到账户入口，不会依赖前端角色状态绕过认证。
+
+Streamlit 固定以 headless 模式启动，不会尝试从 WSL 调用 Windows 浏览器。即使 WSL Interoperability
+被禁用，也可以在 Windows 浏览器中手动打开 <http://127.0.0.1:8501>。
 
 前后端通信统一使用 `OJ_API_BASE_URL`（默认 `http://127.0.0.1:8000`），不要在同一次
 运行中混用 `localhost` 与 `127.0.0.1`。登录后，页面顶部显示当前用户名、角色、退出按钮
